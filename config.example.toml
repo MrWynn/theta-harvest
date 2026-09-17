@@ -1,0 +1,3 @@
+api_key = "replace_with_your_thetadata_api_key"
+symbols = ["NVDA", "AAPL", "CBRS", "NBIS"]
+output_dir = "data"

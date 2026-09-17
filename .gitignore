@@ -1,0 +1,13 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.idea/
+.DS_Store
+*.DS_Store
+data/
+config.toml
+.pytest_cache/
+test-output/

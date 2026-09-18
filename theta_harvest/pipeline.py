@@ -19,9 +19,6 @@ LOGGER = logging.getLogger(__name__)
 
 KEY_COLUMNS = ["symbol", "expiration", "strike", "right", "timestamp"]
 SOURCE_PRIORITY = ["quote", "greeks", "ohlc"]
-HISTORY_START_TIME = "00:00:00"
-HISTORY_END_TIME = "23:59:59.999"
-
 T = TypeVar("T")
 
 
@@ -136,7 +133,6 @@ def _normalize_history(frame: pl.DataFrame, symbol: str) -> pl.DataFrame:
         pl.col("expiration").cast(pl.Date, strict=False),
         pl.col("strike").cast(pl.Float64, strict=False),
         pl.col("right").cast(pl.String, strict=False),
-        pl.col("timestamp").cast(pl.Datetime("us"), strict=False),
     ).unique(subset=KEY_COLUMNS, keep="last", maintain_order=True)
 
 
@@ -405,8 +401,6 @@ class ThetaOptionHarvester:
             "interval": "1m",
             "strike": "*",
             "right": "both",
-            "start_time": HISTORY_START_TIME,
-            "end_time": HISTORY_END_TIME,
         }
         operations = {
             "ohlc": self.client.option_history_ohlc,

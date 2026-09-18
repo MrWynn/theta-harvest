@@ -11,3 +11,5 @@ data/
 config.toml
 .pytest_cache/
 test-output/
+logs/
+run/

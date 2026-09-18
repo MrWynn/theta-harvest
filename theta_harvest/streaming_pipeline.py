@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import csv
-from datetime import date
+from datetime import date, timedelta
 import logging
 import os
 from pathlib import Path
@@ -11,6 +10,13 @@ from uuid import uuid4
 
 import polars as pl
 
+from .completion import (
+    csv_path,
+    day_directory,
+    remove_completion_marker,
+    validate_completion,
+    write_completion_marker,
+)
 from .pipeline import (
     FailedRequest,
     HarvestResult,
@@ -26,6 +32,23 @@ LOGGER = logging.getLogger(__name__)
 DATA_DATE_COLUMN = "data_date"
 
 
+def _date_range(start_date: date, end_date: date) -> list[date]:
+    day_count = (end_date - start_date).days
+    return [start_date + timedelta(days=offset) for offset in range(day_count + 1)]
+
+
+def _csv_ready_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    expressions: list[pl.Expr] = []
+    for column, dtype in frame.schema.items():
+        if dtype == pl.Date:
+            expressions.append(pl.col(column).dt.to_string("%Y-%m-%d"))
+        elif isinstance(dtype, pl.Datetime) and dtype.time_zone is not None:
+            expressions.append(
+                pl.col(column).dt.to_string("%Y-%m-%dT%H:%M:%S%.f%z")
+            )
+    return frame.with_columns(expressions) if expressions else frame
+
+
 class StreamingSymbolStager:
     def __init__(self, symbol: str, output_dir: Path) -> None:
         self.symbol = symbol
@@ -33,103 +56,68 @@ class StreamingSymbolStager:
             prefix=f".{symbol}-staging-", dir=output_dir
         )
         self.directory = Path(self._temporary_directory.name)
-        self.parts_by_year: dict[int, list[Path]] = {}
-        self.partitions_by_year: dict[int, set[tuple[str, str]]] = {}
+        self.parts_by_date: dict[date, list[Path]] = {}
+        self.rows_by_date: dict[date, int] = {}
 
-    def add(self, frame: pl.DataFrame, data_date: date, expiration: date) -> None:
+    def add(self, frame: pl.DataFrame, data_date: date) -> None:
         if frame.is_empty():
             return
-        parts = self.parts_by_year.setdefault(data_date.year, [])
-        path = self.directory / f"{data_date.year}-part-{len(parts):06d}.csv"
-        frame.write_csv(path)
+        parts = self.parts_by_date.setdefault(data_date, [])
+        path = self.directory / f"{data_date:%Y%m%d}-part-{len(parts):06d}.arrow"
+        _csv_ready_frame(frame).write_ipc(path, compression="uncompressed")
         parts.append(path)
-        self.partitions_by_year.setdefault(data_date.year, set()).add(
-            (data_date.isoformat(), expiration.isoformat())
-        )
+        self.rows_by_date[data_date] = self.rows_by_date.get(data_date, 0) + frame.height
 
     def close(self) -> None:
         self._temporary_directory.cleanup()
 
 
-def _read_header(path: Path) -> list[str]:
-    with path.open("r", encoding="utf-8", newline="") as csv_file:
-        reader = csv.reader(csv_file)
-        try:
-            return next(reader)
-        except StopIteration as exc:
-            raise ValueError(f"CSV 文件为空: {path}") from exc
+def _count_csv_rows(path: Path) -> int:
+    line_count = 0
+    with path.open("rb", buffering=8 * 1024 * 1024) as csv_file:
+        while chunk := csv_file.read(8 * 1024 * 1024):
+            line_count += chunk.count(b"\n")
+    return max(0, line_count - 1)
 
 
-def _union_headers(paths: list[Path]) -> list[str]:
-    columns: list[str] = []
-    seen: set[str] = set()
-    for path in paths:
-        for column in _read_header(path):
-            if column not in seen:
-                columns.append(column)
-                seen.add(column)
-    required = [*KEY_COLUMNS, DATA_DATE_COLUMN]
-    missing = [column for column in required if column not in seen]
-    if missing:
-        raise ValueError(f"CSV 缺少幂等写入字段 {missing}: {paths}")
-    return columns
-
-
-def _copy_rows(
-    source: Path,
-    writer: csv.DictWriter,
-    *,
-    skip_partitions: set[tuple[str, str]] | None = None,
-) -> int:
-    count = 0
-    with source.open("r", encoding="utf-8", newline="") as csv_file:
-        reader = csv.DictReader(csv_file)
-        for row in reader:
-            if skip_partitions is not None:
-                partition = (row.get(DATA_DATE_COLUMN, ""), row.get("expiration", ""))
-                if partition in skip_partitions:
-                    continue
-            writer.writerow(row)
-            count += 1
-    return count
-
-
-def merge_into_year_csv_streaming(
+def merge_into_daily_csv(
     symbol: str,
-    year: int,
+    data_date: date,
     parts: list[Path],
-    refreshed_partitions: set[tuple[str, str]],
+    refreshed_expirations: set[str],
+    new_row_count: int,
     output_dir: Path,
+    *,
+    replace_entire_day: bool,
 ) -> tuple[Path, int]:
-    year_dir = output_dir / str(year)
-    year_dir.mkdir(parents=True, exist_ok=True)
-    output_path = year_dir / f"{symbol}.csv"
+    directory = day_directory(output_dir, data_date)
+    directory.mkdir(parents=True, exist_ok=True)
+    output_path = csv_path(output_dir, symbol, data_date)
+    had_existing_file = output_path.exists()
 
-    header_sources = [parts[0]]
-    if output_path.exists():
-        header_sources.append(output_path)
-    header_sources.extend(parts[1:])
-    fieldnames = _union_headers(header_sources)
+    frames = [pl.scan_ipc(path) for path in parts]
+    if had_existing_file and not replace_entire_day:
+        existing = pl.scan_csv(
+            output_path,
+            try_parse_dates=False,
+            infer_schema_length=10_000,
+        ).filter(~pl.col("expiration").is_in(sorted(refreshed_expirations)))
+        frames.append(existing)
+    if not frames:
+        raise ValueError(f"没有可写入的 CSV 数据源: {symbol} {data_date}")
 
-    temporary_path = year_dir / f".{symbol}.{uuid4().hex}.tmp"
-    row_count = 0
+    combined = pl.concat(frames, how="diagonal_relaxed")
+    temporary_path = directory / f".{symbol}.{uuid4().hex}.tmp"
     try:
-        with temporary_path.open("w", encoding="utf-8", newline="") as csv_file:
-            writer = csv.DictWriter(
-                csv_file,
-                fieldnames=fieldnames,
-                extrasaction="ignore",
-                restval="",
-            )
-            writer.writeheader()
-            if output_path.exists():
-                row_count += _copy_rows(
-                    output_path,
-                    writer,
-                    skip_partitions=refreshed_partitions,
-                )
-            for part in parts:
-                row_count += _copy_rows(part, writer)
+        combined.sink_csv(
+            temporary_path,
+            batch_size=65_536,
+            maintain_order=True,
+        )
+        if replace_entire_day or not had_existing_file:
+            row_count = new_row_count
+        else:
+            row_count = _count_csv_rows(temporary_path)
         os.replace(temporary_path, output_path)
     except Exception:
         if temporary_path.exists():
@@ -139,6 +127,17 @@ def merge_into_year_csv_streaming(
 
 
 class ThetaOptionHarvester(BaseThetaOptionHarvester):
+    def run(
+        self,
+        symbols: tuple[str, ...],
+        start_date: date,
+        end_date: date,
+        *,
+        force: bool = False,
+    ) -> HarvestResult:
+        self._force = force
+        return super().run(symbols, start_date, end_date)
+
     def _run_symbol(
         self,
         symbol: str,
@@ -146,7 +145,50 @@ class ThetaOptionHarvester(BaseThetaOptionHarvester):
         end_date: date,
         result: HarvestResult,
     ) -> None:
-        LOGGER.info("开始处理 %s，日期范围 %s 至 %s", symbol, start_date, end_date)
+        requested_dates = _date_range(start_date, end_date)
+        pending_dates: list[date] = []
+        skipped_dates: list[date] = []
+        for data_date in requested_dates:
+            if self._force:
+                if remove_completion_marker(self.output_dir, symbol, data_date):
+                    LOGGER.info("强制重抓，已移除完成标记: symbol=%s date=%s", symbol, data_date)
+                pending_dates.append(data_date)
+                continue
+            is_complete, reason, marker = validate_completion(
+                self.output_dir, symbol, data_date
+            )
+            if is_complete:
+                skipped_dates.append(data_date)
+                LOGGER.info(
+                    "跳过已完整抓取日期: symbol=%s date=%s status=%s",
+                    symbol,
+                    data_date,
+                    marker["status"] if marker else "unknown",
+                )
+            else:
+                pending_dates.append(data_date)
+                LOGGER.info(
+                    "日期需要抓取: symbol=%s date=%s reason=%s",
+                    symbol,
+                    data_date,
+                    reason,
+                )
+
+        if not pending_dates:
+            LOGGER.info(
+                "%s 请求范围内 %d 个日期均已完整抓取，不调用 ThetaData API",
+                symbol,
+                len(skipped_dates),
+            )
+            return
+
+        LOGGER.info(
+            "开始处理 %s，待抓取日期=%s，已跳过日期=%s",
+            symbol,
+            ",".join(value.isoformat() for value in pending_dates),
+            ",".join(value.isoformat() for value in skipped_dates) or "无",
+        )
+        pending_set = set(pending_dates)
         try:
             expiration_frame = _to_polars(
                 call_with_retry(
@@ -164,20 +206,46 @@ class ThetaOptionHarvester(BaseThetaOptionHarvester):
         expirations = sorted(
             expiration
             for expiration in _date_values(expiration_frame, "expiration")
-            if expiration >= start_date
+            if expiration >= min(pending_dates)
         )
-        if not expirations:
-            LOGGER.warning("%s 没有可用于该日期范围的期权到期日", symbol)
-            return
+        checked_expirations = {data_date: set() for data_date in pending_dates}
+        refreshed_expirations = {data_date: set() for data_date in pending_dates}
+        written_expirations = {data_date: set() for data_date in pending_dates}
+        incomplete_dates: set[date] = set()
 
         stager = StreamingSymbolStager(symbol, self.output_dir)
         try:
             for expiration in expirations:
-                dates = self._discover_dates(symbol, expiration, start_date, end_date, result)
+                relevant_dates = {
+                    data_date for data_date in pending_dates if data_date <= expiration
+                }
+                if not relevant_dates:
+                    continue
+                failure_count = len(result.failures)
+                dates = self._discover_dates(
+                    symbol,
+                    expiration,
+                    min(relevant_dates),
+                    max(relevant_dates),
+                    result,
+                )
+                if len(result.failures) != failure_count:
+                    incomplete_dates.update(relevant_dates)
+                    continue
+                for data_date in relevant_dates:
+                    checked_expirations[data_date].add(expiration)
+
                 for data_date in dates:
+                    if data_date not in pending_set:
+                        continue
                     merged = self._fetch_batch(symbol, expiration, data_date, result)
-                    if merged is not None and not merged.is_empty():
-                        stager.add(merged, data_date, expiration)
+                    if merged is None:
+                        incomplete_dates.add(data_date)
+                        continue
+                    refreshed_expirations[data_date].add(expiration)
+                    if not merged.is_empty():
+                        stager.add(merged, data_date)
+                        written_expirations[data_date].add(expiration)
                         LOGGER.info(
                             "完成 symbol=%s expiration=%s date=%s rows=%d",
                             symbol,
@@ -187,22 +255,125 @@ class ThetaOptionHarvester(BaseThetaOptionHarvester):
                         )
 
             written_paths: list[Path] = []
-            for year, parts in sorted(stager.parts_by_year.items()):
-                output_path, row_count = merge_into_year_csv_streaming(
-                    symbol,
-                    year,
-                    parts,
-                    stager.partitions_by_year[year],
-                    self.output_dir,
+            for data_date in pending_dates:
+                is_complete = data_date not in incomplete_dates
+                parts = stager.parts_by_date.get(data_date, [])
+                output_path = csv_path(self.output_dir, symbol, data_date)
+                refreshed = refreshed_expirations[data_date]
+                should_write_partial = bool(parts) or (
+                    not is_complete and output_path.exists() and bool(refreshed)
                 )
-                written_paths.append(output_path)
-                result.rows_by_file[str(output_path)] = row_count
-                LOGGER.info("写入完成: %s，共 %d 行", output_path, row_count)
+
+                if is_complete and not parts:
+                    try:
+                        if output_path.exists():
+                            output_path.unlink()
+                        marker = write_completion_marker(
+                            self.output_dir,
+                            symbol,
+                            data_date,
+                            status="no_data",
+                            row_count=0,
+                            checked_expirations=checked_expirations[data_date],
+                            written_expirations=set(),
+                        )
+                        LOGGER.info(
+                            "日期完整但无数据，已写完成标记: symbol=%s date=%s marker=%s",
+                            symbol,
+                            data_date,
+                            marker,
+                        )
+                    except Exception as exc:
+                        LOGGER.error(
+                            "写入无数据完成标记失败: symbol=%s date=%s\n%s",
+                            symbol,
+                            data_date,
+                            traceback.format_exc(),
+                        )
+                        result.failures.append(
+                            FailedRequest(
+                                "completion_marker:no_data",
+                                symbol,
+                                data_date=data_date,
+                                error=str(exc),
+                            )
+                        )
+                    continue
+
+                if is_complete or should_write_partial:
+                    try:
+                        output_path, row_count = merge_into_daily_csv(
+                            symbol,
+                            data_date,
+                            parts,
+                            {value.isoformat() for value in refreshed},
+                            stager.rows_by_date.get(data_date, 0),
+                            self.output_dir,
+                            replace_entire_day=is_complete,
+                        )
+                        written_paths.append(output_path)
+                        result.rows_by_file[str(output_path)] = row_count
+                        LOGGER.info("写入完成: %s，共 %d 行", output_path, row_count)
+                    except Exception as exc:
+                        incomplete_dates.add(data_date)
+                        LOGGER.error(
+                            "写入每日 CSV 失败: symbol=%s date=%s\n%s",
+                            symbol,
+                            data_date,
+                            traceback.format_exc(),
+                        )
+                        result.failures.append(
+                            FailedRequest(
+                                "daily_csv_write",
+                                symbol,
+                                data_date=data_date,
+                                error=str(exc),
+                            )
+                        )
+                        continue
+
+                if data_date in incomplete_dates:
+                    LOGGER.warning(
+                        "日期未完整抓取，不写完成标记: symbol=%s date=%s",
+                        symbol,
+                        data_date,
+                    )
+                    continue
+
+                try:
+                    marker = write_completion_marker(
+                        self.output_dir,
+                        symbol,
+                        data_date,
+                        status="complete",
+                        row_count=result.rows_by_file[str(output_path)],
+                        checked_expirations=checked_expirations[data_date],
+                        written_expirations=written_expirations[data_date],
+                    )
+                    LOGGER.info(
+                        "日期完整抓取成功: symbol=%s date=%s marker=%s",
+                        symbol,
+                        data_date,
+                        marker,
+                    )
+                except Exception as exc:
+                    LOGGER.error(
+                        "写入完成标记失败: symbol=%s date=%s\n%s",
+                        symbol,
+                        data_date,
+                        traceback.format_exc(),
+                    )
+                    result.failures.append(
+                        FailedRequest(
+                            "completion_marker",
+                            symbol,
+                            data_date=data_date,
+                            error=str(exc),
+                        )
+                    )
 
             if written_paths:
                 result.written_files[symbol] = written_paths
-            else:
-                LOGGER.warning("%s 在指定日期范围内没有历史期权数据", symbol)
         except Exception as exc:
             LOGGER.error("处理 %s 时发生未恢复错误\n%s", symbol, traceback.format_exc())
             result.failures.append(FailedRequest("symbol_pipeline", symbol, error=str(exc)))

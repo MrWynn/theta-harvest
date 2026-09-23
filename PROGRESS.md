@@ -2,7 +2,7 @@
 
 ## Current Status
 
-ThetaData 采集器现已支持单个认证 session 内的有界并发采集，CSV 与 ClickHouse 共用同一调度器；正式 PRO 配置使用 8 workers。19 个非 live 测试全部通过；`NVDA / 2026-09-16` 的真实 8 workers 验收成功，写入及唯一键均为 1,599,972，重复运行通过进度直接跳过。当前无代码阻塞。
+ThetaData 采集器现已支持单个认证 session 内的有界并发采集，CSV 与 ClickHouse 共用同一调度器；正式 PRO 配置使用 8 workers。`option_list_dates()` 的正常无数据响应已改为空结果处理，不再重试或阻断另一类日期发现。21 个非 live 测试全部通过；`NVDA / 2026-09-16` 的真实 8 workers 验收成功，写入及唯一键均为 1,599,972，重复运行通过进度直接跳过。当前无代码阻塞。
 
 ## Completed
 
@@ -42,6 +42,8 @@ ThetaData 采集器现已支持单个认证 session 内的有界并发采集，C
 - 并发真实数据核验通过：`FINAL` 行数与唯一键均为 1,599,972，25 个有数据到期日、279 个行权价、CALL/PUT，美东时间严格为 09:30–16:00，进度为 `complete`。
 - 真实并发期间没有 `UNAUTHENTICATED` 或订阅限流；首次 expirations 请求的一次本机 SOCKS 握手中断由原有重试恢复。
 - 同日期第二次运行直接显示“所有 symbol/date 均已同步，不创建 ThetaData client”。
+- `option_list_dates()` 返回 `NoDataFoundError` 时不再执行五次重试或发送 Lark 告警，而是将对应 `trade`/`quote` 类型视为空集合并继续查询另一类型；两类均无数据时视为该到期日已成功检查。
+- 新增日期发现回归测试，覆盖单侧无数据仍使用另一侧日期，以及 trade/quote 均无数据的正常空结果；非 live 测试现为 `21 passed, 1 deselected`。
 
 ## In Progress
 
@@ -63,3 +65,4 @@ ThetaData 采集器现已支持单个认证 session 内的有界并发采集，C
 - 在 AWS 直连环境记录 8 workers 的阶段耗时；若服务端或网络争用导致收益有限，只需将 `max_concurrent_requests` 调整为 4。
 - 根据实际业务日期运行其余配置 symbols；NVDA 2026-09-15 和 2026-09-16 已有完成进度，将自动跳过。
 - 如需验证人工重同步，可删除目标 symbol/date 的进度后再运行，并分别用普通查询和 `FINAL` 检查物理重复及合并结果。
+- 将本次 `NoDataFoundError` 分类修复部署到 AWS 后，复跑此前失败日期，确认日志只输出一次“按空结果处理”且继续完成其他到期日。

@@ -14,6 +14,7 @@ from typing import Any, TypeVar
 from uuid import uuid4
 
 import polars as pl
+from thetadata.errors import NoDataFoundError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -144,11 +145,14 @@ def call_with_retry(
     context: str,
     attempts: int = 5,
     on_exhausted: Callable[[str, str, BaseException], None] | None = None,
+    non_retryable_exceptions: tuple[type[BaseException], ...] = (),
 ) -> T:
     for attempt in range(1, attempts + 1):
         try:
             return operation()
         except Exception as exc:
+            if isinstance(exc, non_retryable_exceptions):
+                raise
             LOGGER.exception(
                 "%s 失败 (%s)，第 %d/%d 次尝试: %s: %s",
                 operation_name,
@@ -509,9 +513,16 @@ class ThetaOptionHarvester:
                         operation_name="option_list_dates",
                         context=context,
                         on_exhausted=self._notify_error,
+                        non_retryable_exceptions=(NoDataFoundError,),
                     )
                 )
                 available_dates.update(_date_values(frame, "date"))
+            except NoDataFoundError:
+                LOGGER.info(
+                    "option_list_dates 无数据，按空结果处理 (%s)",
+                    context,
+                )
+                continue
             except Exception as exc:
                 result.failures.append(
                     FailedRequest(

@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 import pytest
+from thetadata.errors import NoDataFoundError
 
 from theta_harvest.clickhouse_pipeline import ClickHouseThetaOptionHarvester
 from theta_harvest.client_session import RefreshingThetaClient
@@ -146,6 +147,58 @@ class RecordingNotifier:
 
     def notify_error(self, operation: str, context: str, exc: BaseException) -> None:
         self.calls.append(operation)
+
+
+class NoDataDatesClient:
+    def __init__(self, no_data_types: set[str]) -> None:
+        self.no_data_types = no_data_types
+        self.calls: list[str] = []
+
+    def option_list_dates(self, *, request_type: str, **_: object) -> pl.DataFrame:
+        self.calls.append(request_type)
+        if request_type in self.no_data_types:
+            raise NoDataFoundError(f"no {request_type} dates")
+        return pl.DataFrame({"date": [date(2026, 9, 15)]})
+
+
+def test_date_discovery_treats_no_data_as_empty_and_continues(tmp_path: Path) -> None:
+    client = NoDataDatesClient({"trade"})
+    notifier = RecordingNotifier()
+    harvester = ThetaOptionHarvester(client, tmp_path, notifier=notifier)
+    result = HarvestResult()
+
+    dates = harvester._discover_dates(
+        "NVDA",
+        date(2026, 9, 16),
+        date(2026, 9, 15),
+        date(2026, 9, 15),
+        result,
+    )
+
+    assert dates == [date(2026, 9, 15)]
+    assert client.calls == ["trade", "quote"]
+    assert not result.failures
+    assert not notifier.calls
+
+
+def test_date_discovery_accepts_both_request_types_without_data(tmp_path: Path) -> None:
+    client = NoDataDatesClient({"trade", "quote"})
+    notifier = RecordingNotifier()
+    harvester = ThetaOptionHarvester(client, tmp_path, notifier=notifier)
+    result = HarvestResult()
+
+    dates = harvester._discover_dates(
+        "NVDA",
+        date(2026, 9, 16),
+        date(2026, 9, 15),
+        date(2026, 9, 15),
+        result,
+    )
+
+    assert dates == []
+    assert client.calls == ["trade", "quote"]
+    assert not result.failures
+    assert not notifier.calls
 
 
 class FailingHistoryClient:

@@ -2,29 +2,36 @@
 
 ## Current Status
 
-ThetaData 全量期权链采集器现已实现按 `symbol + data_date` 的持久化完成标记和增量跳过。只有到期日/日期发现、三类历史接口、CSV 合并及原子落盘全部成功的日期才会标记完成；普通重复运行跳过有效标记，`--force` 会在创建 ThetaData client 前移除请求范围内的标记并完整重抓。Python 编译、AWS Bash 脚本语法检查和 5 个非 live 测试均通过，当前无代码阻塞。为避免与 AWS 后台任务争抢同一 API session，本次没有执行真实 API 全链测试。
+ThetaData 采集器现已支持互斥的 `csv` / `clickhouse` 存储模式。CSV 的日文件、完成标记和 `--force` 行为保持不变；ClickHouse 模式实时调用 ThetaData，按日 Arrow 暂存并通过 Native TCP/LZ4 列式分批写入，全部数据成功后才写进度。Lark 已接入最终重试失败及无重试错误的即时告警。13 个非 live 测试全部通过；`NVDA / 2026-09-15` 的真实 ThetaData→ClickHouse 全链验收已成功，正式表 `FINAL` 行数及唯一键均为 1,584,332，重复运行通过进度直接跳过。当前无代码阻塞。
 
 ## Completed
 
-- 支持配置多个 symbols、命令行日期范围和 1m OHLC/Quote/Greeks 获取。
-- 使用 expirations 和 trade/quote dates 接口发现全部有效到期日及数据日期。
-- 三个历史接口不传 `start_time/end_time`，使用 ThetaData 默认美东 `09:30:00–16:00:00`。
-- timestamp 不转换时区；CSV 保留 API 返回的本地时间与 offset。
-- 实现 5 次指数退避、完整 traceback、失败批次隔离和非零退出码。
-- 新增 `RefreshingThetaClient`：仅在 gRPC `UNAUTHENTICATED` 或 `Invalid session ID` 时重新认证，普通网络异常不重建 client。
-- 实现三表全外连接、公共字段合并及按 `data/YYYY/MM/DD/SYMBOL.csv` 的日分区写入。
-- 写入使用无压缩 Arrow 临时分片、Polars 流式 CSV 合并和原子替换。
-- 新增 `data/YYYY/MM/DD/.SYMBOL.complete.json`，记录 marker/数据版本、请求签名、状态、完成时间、CSV 文件名/大小/行数、已检查及已写入到期日。
-- 完成标记验证覆盖 JSON 损坏、版本不符、CSV 缺失和文件大小变化；无效时重新抓取。
-- 全部列表请求成功但当天无数据时写 `no_data` 标记，不要求 CSV 存在。
-- 完整日期使用本次抓取结果重建日 CSV；不完整日期可保留本次成功部分和旧的未刷新到期日，但不生成完成标记。
-- 普通重复运行按 symbol/date 跳过；当请求范围全部完成时，在创建 ThetaData client 前直接成功退出。
-- 新增 CLI `--force`；强制刷新在客户端鉴权前移除范围内所有标记，失败后旧 CSV 保留但日期保持未完成。
-- `scripts/theta-harvest.sh start START_DATE END_DATE [--force]` 已支持强制刷新；兼容脚本继续透传参数。
-- 真实 API live 测试已扩展为首次抓取、零写入跳过、文件大小/mtime 不变及 `--force` 第二次真实抓取。
-- 非 live 文件系统测试通过：`5 passed, 1 deselected`；Python `compileall` 通过；两个 AWS shell 脚本通过 Git Bash `bash -n`。
-- 既有真实 API 验证：NVDA 单到期日全部 strike/right 共 53,958 行；timestamp 为 `America/New_York`，范围严格为 09:30–16:00、391 分钟。
-- 既有写入性能验证：198,720 行真实历史数据首次约 0.30 秒，重复覆盖约 0.69 秒。
+- 保留多 symbols、日期范围、1m OHLC/Quote/Greeks、全外连接、全部 strike/right 和 ThetaData 默认美东请求时段。
+- CSV 继续按 `data/YYYY/MM/DD/SYMBOL.csv` 写入，保留 API timestamp，不进行上海时区转换。
+- CSV 完成标记继续按 `symbol + data_date` 校验和跳过；`--force` 仅用于 CSV。
+- CLI 新增 `--storage csv|clickhouse`，默认 `csv`；ClickHouse 与 `--force` 组合会在加载配置前拒绝。
+- ClickHouse 模式不读取或生成 CSV/CSV 完成标记，进度完成时可在创建 ThetaData client 前跳过。
+- 新增 `clickhouse_schema.sql`，数据表为无版本列 `ReplacingMergeTree()`，月分区且完整唯一键进入排序键；进度表为 `ReplacingMergeTree(completed_at)`。
+- 程序只执行 `CREATE TABLE IF NOT EXISTS`，并校验列类型、引擎、分区键、主键和排序键，不自动修改已有表。
+- 正式 `laevitas.thetadata_options_chain_1m` 与进度表已创建/确认兼容；校验兼容 ClickHouse 将 `toYYYY()` 规范化为 `toYear()` 的行为。
+- ClickHouse 仅保存键、OHLC、Quote、`delta/gamma/theta/vega/rho/underlying_time/underlying_price`；`underlying_timestamp` 映射为 `underlying_time`。
+- NaN/正负无穷转换为 `NULL`，合法零值保留；Call/Put 规范化为表内 `CALL/PUT` Enum。
+- 写入采用本地无压缩 Arrow 分片、Polars streaming batches、约 250,000 行批次和 clickhouse-driver columnar insert，关闭逐值类型检查。
+- 数据全部批次成功后才写 `complete` 进度；确认无数据只写 `no_data`；插入中断或部分 API 失败不写进度。
+- 进度缺失时直接重新采集并插入，不执行数据 DELETE；同键数据由 `ReplacingMergeTree()` 后台合并。
+- Lark 告警包含主机、模式、日期、上下文、操作、异常类型和截断 traceback；重试操作仅在最终耗尽时发送一次。
+- Lark 最多尝试 3 次，发送失败只写日志；API key、ClickHouse 密码和 Webhook 会从消息中脱敏。
+- AWS 管理脚本支持透传 `--storage csv|clickhouse` 和 `--force`；兼容脚本继续透传全部参数。
+- `config.toml` 已写入正式 ClickHouse/Lark 配置且仍被 `.gitignore` 忽略；`config.example.toml` 只含占位值。
+- 新增 clickhouse-driver LZ4 和 httpx 依赖，当前本地虚拟环境已安装 ClickHouse 驱动。
+- 非 live 测试通过：`13 passed, 1 deselected`，覆盖字段白名单、时间映射、NaN/零值、列式插入、失败不写进度、no_data、FINAL 进度查询、CLI 互斥和本地 HTTP Lark 重试。
+- 真实测试首次写入时，ThetaData 全部 26 个相关到期日检查和 25 个有数据到期日暂存成功；ClickHouse 第二批因原 120 秒读写超时失败，已验证只残留首批 53,958 行且进度表没有误写完成。
+- ClickHouse `send_receive_timeout` 已提高到 900 秒；失败后普通重跑会完整重新采集，不删除旧行，并由 `ReplacingMergeTree()` 合并相同键。
+- 修正后真实全链写入成功：本轮写入 1,584,332 行，进度为 `complete`，`checked_expiration_count=26`、`written_expiration_count=25`。
+- 正式表验收通过：原始行数与 `FINAL` 行数均为 1,584,332，复合唯一键数同为 1,584,332；包含 25 个到期日、279 个行权价及 `CALL/PUT`。
+- 真实时间范围为 `2026-09-15 09:30:00-04:00` 至 `16:00:00-04:00`，最早到期日 `2026-09-16`，最晚 `2029-01-19`。
+- 同日期第二次运行约 6.4 秒完成，明确输出“请求范围内所有 symbol/date 均已同步，不创建 ThetaData client”，没有重复采集或写入。
+- 测试后 `config.toml` 的 symbols 已恢复为 `NVDA, AAPL, CBRS, NBIS`。
 
 ## In Progress
 
@@ -32,16 +39,15 @@ ThetaData 全量期权链采集器现已实现按 `symbol + data_date` 的持久
 
 ## Known Issues
 
-- 如果另一台机器持续使用同一 API key，多个独立登录会不断互相使 session 失效；自动重建最多随单请求尝试 5 次，不会无限抢占会话。
-- 本次未运行真实 API 全链 live 测试，以免影响 AWS 上可能正在使用同一 API key 的后台进程；live 验收状态仍待服务器侧确认。
-- 未完成日期按日完整重抓，不实现单个 expiration/API 请求级别的跨进程断点。
-- 旧版 `data/<year>/<symbol>.csv` 不会自动迁移到日目录，也不会参与新日文件的完成判定。
-- 四个 symbols 的完整单日强制双跑可能持续数小时并产生数 GB 临时文件。
-- ThetaData gRPC 经本机 SOCKS 代理偶发流中断，重试机制已在既有真实调用中验证可恢复。
+- 如果另一台机器持续使用同一 ThetaData API key，多个独立登录仍会互相使 session 失效；本轮已确认测试期间没有其他任务占用。
+- `ReplacingMergeTree()` 只替换相同排序键；新版彻底缺少的旧唯一键不会自动删除，需要人工清理对应 symbol/date 后重同步。
+- 后台 merge 完成前查询可能看到同键多行；需要即时去重时使用 `FINAL`。
+- ClickHouse 数据写入成功但进度写入失败时，下次会重写整日；这是预期的至少一次写入语义，最终由 ReplacingMergeTree 合并。
+- 未完成日期按日完整重抓，不实现单 expiration/API 的跨进程断点。
+- 当前 Windows 环境的 WSL Bash 启动被系统拒绝，因此本轮未重新执行 `bash -n`；脚本改动仅为参数透传，需在 AWS 部署前复核。
 
 ## Next Steps
 
-- 将新版部署到 AWS，停止旧后台任务后再启动新版，使完成标记、增量跳过和 `--force` 生效。
-- 选择一个已结束历史日期执行首次真实抓取，核对每日 CSV 与 `.SYMBOL.complete.json` 的状态、文件大小和行数。
-- 对同一日期普通重复运行，确认日志显示跳过且 CSV 大小和修改时间不变。
-- 在确保没有其他 ThetaData session 后执行一次 `--force` 或 `python -m pytest -m live -s`，完成四 symbols 真实 API 验收。
+- 在 Amazon Linux 上运行 `bash -n scripts/theta-harvest.sh scripts/start_aws_linux.sh`，再使用服务脚本启动 ClickHouse 模式。
+- 根据实际业务日期运行其余配置 symbols；NVDA 2026-09-15 已有完成进度，将自动跳过。
+- 如需验证人工重同步，可删除目标 symbol/date 的进度后再运行，并分别用普通查询和 `FINAL` 检查物理重复及合并结果。

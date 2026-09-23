@@ -195,6 +195,7 @@ class ThetaOptionHarvester(BaseThetaOptionHarvester):
                     lambda: self.client.option_list_expirations(symbol=symbol),
                     operation_name="option_list_expirations",
                     context=f"symbol={symbol}",
+                    on_exhausted=self._notify_error,
                 )
             )
         except Exception as exc:
@@ -298,6 +299,11 @@ class ThetaOptionHarvester(BaseThetaOptionHarvester):
                                 error=str(exc),
                             )
                         )
+                        self._notify_error(
+                            "completion_marker:no_data",
+                            f"symbol={symbol} date={data_date}",
+                            exc,
+                        )
                     continue
 
                 if is_complete or should_write_partial:
@@ -329,6 +335,11 @@ class ThetaOptionHarvester(BaseThetaOptionHarvester):
                                 data_date=data_date,
                                 error=str(exc),
                             )
+                        )
+                        self._notify_error(
+                            "daily_csv_write",
+                            f"symbol={symbol} date={data_date}",
+                            exc,
                         )
                         continue
 
@@ -371,11 +382,17 @@ class ThetaOptionHarvester(BaseThetaOptionHarvester):
                             error=str(exc),
                         )
                     )
+                    self._notify_error(
+                        "completion_marker",
+                        f"symbol={symbol} date={data_date}",
+                        exc,
+                    )
 
             if written_paths:
                 result.written_files[symbol] = written_paths
         except Exception as exc:
             LOGGER.error("处理 %s 时发生未恢复错误\n%s", symbol, traceback.format_exc())
+            self._notify_error("symbol_pipeline", f"symbol={symbol}", exc)
             result.failures.append(FailedRequest("symbol_pipeline", symbol, error=str(exc)))
         finally:
             stager.close()

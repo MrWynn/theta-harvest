@@ -9,7 +9,7 @@ PID_FILE="$ROOT_DIR/run/theta-harvest.pid"
 usage() {
   cat >&2 <<EOF
 Usage:
-  $0 start YYYY-MM-DD YYYY-MM-DD [--force]
+  $0 start YYYY-MM-DD YYYY-MM-DD [--storage csv|clickhouse] [--force]
   $0 status
   $0 stop
 EOF
@@ -73,24 +73,20 @@ ensure_runtime() {
 }
 
 start_service() {
-  if [[ $# -lt 2 || $# -gt 3 ]]; then
+  if [[ $# -lt 2 ]]; then
     usage
     return 2
   fi
 
   local start_date="$1"
   local end_date="$2"
-  local force_argument="${3:-}"
+  shift 2
+  local -a extra_arguments=("$@")
   local date_pattern='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
   if [[ ! "$start_date" =~ $date_pattern || ! "$end_date" =~ $date_pattern ]]; then
     echo "Error: dates must use YYYY-MM-DD format." >&2
     return 2
   fi
-  if [[ -n "$force_argument" && "$force_argument" != "--force" ]]; then
-    echo "Error: the optional third argument must be --force." >&2
-    return 2
-  fi
-
   cd "$ROOT_DIR"
   mkdir -p "$ROOT_DIR/logs" "$ROOT_DIR/run"
 
@@ -118,9 +114,7 @@ start_service() {
     "$ROOT_DIR/.venv/bin/python" "$ROOT_DIR/main.py"
     --start-date "$start_date" --end-date "$end_date"
   )
-  if [[ "$force_argument" == "--force" ]]; then
-    command+=(--force)
-  fi
+  command+=("${extra_arguments[@]}")
   nohup "${command[@]}" >"$log_file" 2>&1 &
   process_pid=$!
   printf '%s\n' "$process_pid" >"$PID_FILE"

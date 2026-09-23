@@ -73,6 +73,7 @@ def call_with_retry(
     operation_name: str,
     context: str,
     attempts: int = 5,
+    on_exhausted: Callable[[str, str, BaseException], None] | None = None,
 ) -> T:
     for attempt in range(1, attempts + 1):
         try:
@@ -88,9 +89,16 @@ def call_with_retry(
                 exc,
             )
             if attempt == attempts:
-                raise RetryExhaustedError(
+                exhausted = RetryExhaustedError(
                     f"{operation_name} 在 {attempts} 次尝试后仍失败 ({context})"
-                ) from exc
+                )
+                if on_exhausted is not None:
+                    on_exhausted(operation_name, context, exc)
+                    try:
+                        setattr(exhausted, "_lark_notified", True)
+                    except Exception:
+                        pass
+                raise exhausted from exc
             delay = min(2 ** (attempt - 1), 60)
             LOGGER.warning("%d 秒后重试 %s (%s)", delay, operation_name, context)
             time.sleep(delay)
@@ -254,10 +262,17 @@ def merge_into_year_csv(
 
 
 class ThetaOptionHarvester:
-    def __init__(self, client: Any, output_dir: Path) -> None:
+    def __init__(self, client: Any, output_dir: Path, notifier: Any | None = None) -> None:
         self.client = client
         self.output_dir = output_dir
+        self.notifier = notifier
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _notify_error(
+        self, operation: str, context: str, exc: BaseException
+    ) -> None:
+        if self.notifier is not None:
+            self.notifier.notify_error(operation, context, exc)
 
     def run(self, symbols: tuple[str, ...], start_date: date, end_date: date) -> HarvestResult:
         result = HarvestResult()
@@ -291,6 +306,7 @@ class ThetaOptionHarvester:
                     lambda: self.client.option_list_expirations(symbol=symbol),
                     operation_name="option_list_expirations",
                     context=f"symbol={symbol}",
+                    on_exhausted=self._notify_error,
                 )
             )
         except Exception as exc:
@@ -366,6 +382,7 @@ class ThetaOptionHarvester:
                         ),
                         operation_name="option_list_dates",
                         context=context,
+                        on_exhausted=self._notify_error,
                     )
                 )
                 available_dates.update(_date_values(frame, "date"))
@@ -415,6 +432,7 @@ class ThetaOptionHarvester:
                         lambda operation=operation: operation(**common_arguments),
                         operation_name=f"option_history_{name}",
                         context=context,
+                        on_exhausted=self._notify_error,
                     )
                 )
             except Exception as exc:
@@ -439,6 +457,7 @@ class ThetaOptionHarvester:
             )
         except Exception as exc:
             LOGGER.error("拼接失败 (%s)\n%s", context, traceback.format_exc())
+            self._notify_error("merge_history", context, exc)
             result.failures.append(
                 FailedRequest(
                     "merge_history",

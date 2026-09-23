@@ -3,3 +3,5 @@ polars>=1.33.1,<2
 python-dotenv>=1.2,<2
 socksio>=1,<2
 pytest>=9,<10
+clickhouse-driver[lz4]>=0.2.9,<0.3
+httpx>=0.28,<1

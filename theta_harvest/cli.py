@@ -5,6 +5,7 @@ from datetime import date, timedelta
 import logging
 from pathlib import Path
 import sys
+import tomllib
 import traceback
 
 from thetadata import ThetaClient
@@ -12,6 +13,9 @@ from thetadata import ThetaClient
 from .client_session import RefreshingThetaClient
 from .completion import remove_completion_marker, validate_completion
 from .config import load_config
+from .clickhouse_pipeline import ClickHouseThetaOptionHarvester
+from .clickhouse_storage import ClickHouseStorage
+from .notifier import LarkNotifier
 from .pipeline import call_with_retry
 from .streaming_pipeline import ThetaOptionHarvester
 
@@ -33,6 +37,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-date", required=True, type=parse_date)
     parser.add_argument("--end-date", required=True, type=parse_date)
     parser.add_argument("--config", type=Path, default=Path("config.toml"))
+    parser.add_argument(
+        "--storage",
+        choices=("csv", "clickhouse"),
+        default="csv",
+        help="存储模式，默认 csv",
+    )
     parser.add_argument(
         "--force",
         action="store_true",
@@ -101,23 +111,78 @@ def main(argv: list[str] | None = None) -> int:
     if args.start_date > args.end_date:
         print("错误: --start-date 不能晚于 --end-date", file=sys.stderr)
         return 2
+    if args.storage == "clickhouse" and args.force:
+        print("错误: --force 仅允许用于 --storage csv", file=sys.stderr)
+        return 2
 
+    notifier: LarkNotifier | None = None
     try:
+        try:
+            with args.config.resolve().open("rb") as config_file:
+                raw_config = tomllib.load(config_file)
+            raw_lark = raw_config.get("lark")
+            if isinstance(raw_lark, dict) and isinstance(raw_lark.get("webhook_url"), str):
+                notifier = LarkNotifier(
+                    raw_lark["webhook_url"],
+                    storage=args.storage,
+                    start_date=args.start_date,
+                    end_date=args.end_date,
+                )
+        except Exception:
+            pass
         config = load_config(args.config.resolve())
-        if args.force:
-            _remove_requested_markers(
+        notifier = LarkNotifier(
+            config.lark.webhook_url,
+            storage=args.storage,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            secrets=(
+                config.api_key,
+                config.clickhouse.password if config.clickhouse is not None else "",
+            ),
+        )
+
+        storage: ClickHouseStorage | None = None
+        completed_dates: set[tuple[str, date]] = set()
+        if args.storage == "csv":
+            if args.force:
+                _remove_requested_markers(
+                    config.output_dir,
+                    config.symbols,
+                    args.start_date,
+                    args.end_date,
+                )
+            elif _all_requested_dates_complete(
                 config.output_dir,
                 config.symbols,
                 args.start_date,
                 args.end_date,
-            )
-        elif _all_requested_dates_complete(
-            config.output_dir,
-            config.symbols,
-            args.start_date,
-            args.end_date,
-        ):
-            return 0
+            ):
+                return 0
+        else:
+            if config.clickhouse is None:
+                raise ValueError("--storage clickhouse 要求 config.toml 提供 [clickhouse]")
+            try:
+                storage = ClickHouseStorage(config.clickhouse, notifier)
+                storage.initialize(Path(__file__).resolve().parent.parent / "clickhouse_schema.sql")
+                completed_dates = storage.completed_dates(
+                    config.symbols, args.start_date, args.end_date
+                )
+            except Exception as exc:
+                notifier.notify_error(
+                    "clickhouse_initialize",
+                    f"start={args.start_date} end={args.end_date}",
+                    exc,
+                )
+                raise
+            expected = {
+                (symbol, data_date)
+                for symbol in config.symbols
+                for data_date in _requested_dates(args.start_date, args.end_date)
+            }
+            if expected <= completed_dates:
+                LOGGER.info("请求范围内所有 symbol/date 均已同步，不创建 ThetaData client")
+                return 0
 
         def create_client() -> ThetaClient:
             return ThetaClient(api_key=config.api_key, dataframe_type="polars")
@@ -126,16 +191,29 @@ def main(argv: list[str] | None = None) -> int:
             create_client,
             operation_name="ThetaClient authentication",
             context="production API",
+            on_exhausted=notifier.notify_error,
         )
         client = RefreshingThetaClient(initial_client, create_client)
-        result = ThetaOptionHarvester(client, config.output_dir).run(
-            config.symbols,
-            args.start_date,
-            args.end_date,
-            force=args.force,
-        )
+        if args.storage == "csv":
+            result = ThetaOptionHarvester(client, config.output_dir, notifier).run(
+                config.symbols,
+                args.start_date,
+                args.end_date,
+                force=args.force,
+            )
+        else:
+            assert storage is not None
+            result = ClickHouseThetaOptionHarvester(
+                client, storage, completed_dates, notifier
+            ).run(config.symbols, args.start_date, args.end_date)
         return result.exit_code
-    except Exception:
+    except Exception as exc:
+        if notifier is not None:
+            notifier.notify_error(
+                "unhandled_exception",
+                f"start={args.start_date} end={args.end_date}",
+                exc,
+            )
         print("程序发生未处理错误:", file=sys.stderr)
         traceback.print_exc()
         return 1

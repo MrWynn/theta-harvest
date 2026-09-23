@@ -6,6 +6,7 @@ from pathlib import Path
 from theta_harvest.cli import (
     _all_requested_dates_complete,
     _remove_requested_markers,
+    main,
 )
 from theta_harvest.completion import marker_path, write_completion_marker
 
@@ -40,3 +41,16 @@ def test_complete_range_skips_and_force_invalidates_before_client(
     for symbol in symbols:
         for data_date in (start_date, end_date):
             assert not marker_path(tmp_path, symbol, data_date).exists()
+
+
+def test_clickhouse_mode_rejects_force_before_loading_config() -> None:
+    exit_code = main(
+        [
+            "--start-date", "2026-09-15",
+            "--end-date", "2026-09-15",
+            "--storage", "clickhouse",
+            "--force",
+            "--config", "does-not-exist.toml",
+        ]
+    )
+    assert exit_code == 2

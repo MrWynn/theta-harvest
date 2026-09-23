@@ -1,3 +1,15 @@
 api_key = "replace_with_your_thetadata_api_key"
 symbols = ["NVDA", "AAPL", "CBRS", "NBIS"]
 output_dir = "data"
+
+[clickhouse]
+database = "replace_with_database"
+host = "replace_with_clickhouse_host"
+port = 9000
+user = "replace_with_clickhouse_user"
+password = "replace_with_clickhouse_password"
+data_table = "thetadata_options_chain_1m"
+progress_table = "thetadata_options_chain_1m_progress"
+
+[lark]
+webhook_url = "https://open.larksuite.com/open-apis/bot/v2/hook/replace_with_webhook_token"

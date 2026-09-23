@@ -10,6 +10,31 @@ class AppConfig:
     api_key: str
     symbols: tuple[str, ...]
     output_dir: Path
+    clickhouse: ClickHouseConfig | None
+    lark: LarkConfig
+
+
+@dataclass(frozen=True)
+class ClickHouseConfig:
+    database: str
+    host: str
+    port: int
+    user: str
+    password: str
+    data_table: str
+    progress_table: str
+
+
+@dataclass(frozen=True)
+class LarkConfig:
+    webhook_url: str
+
+
+def _required_string(section: dict[str, object], key: str, section_name: str) -> str:
+    value = section.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"config.toml 的 [{section_name}] 必须提供非空 {key}")
+    return value.strip()
 
 
 def load_config(path: Path) -> AppConfig:
@@ -44,8 +69,37 @@ def load_config(path: Path) -> AppConfig:
     if not output_dir.is_absolute():
         output_dir = path.parent / output_dir
 
+    raw_lark = raw.get("lark")
+    if not isinstance(raw_lark, dict):
+        raise ValueError("config.toml 必须提供 [lark] 配置")
+    lark = LarkConfig(
+        webhook_url=_required_string(raw_lark, "webhook_url", "lark")
+    )
+
+    raw_clickhouse = raw.get("clickhouse")
+    clickhouse: ClickHouseConfig | None = None
+    if raw_clickhouse is not None:
+        if not isinstance(raw_clickhouse, dict):
+            raise ValueError("config.toml 的 [clickhouse] 必须是配置表")
+        port = raw_clickhouse.get("port")
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError("config.toml 的 [clickhouse].port 必须是有效端口")
+        clickhouse = ClickHouseConfig(
+            database=_required_string(raw_clickhouse, "database", "clickhouse"),
+            host=_required_string(raw_clickhouse, "host", "clickhouse"),
+            port=port,
+            user=_required_string(raw_clickhouse, "user", "clickhouse"),
+            password=_required_string(raw_clickhouse, "password", "clickhouse"),
+            data_table=_required_string(raw_clickhouse, "data_table", "clickhouse"),
+            progress_table=_required_string(
+                raw_clickhouse, "progress_table", "clickhouse"
+            ),
+        )
+
     return AppConfig(
         api_key=api_key.strip(),
         symbols=tuple(symbols),
         output_dir=output_dir.resolve(),
+        clickhouse=clickhouse,
+        lark=lark,
     )

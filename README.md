@@ -52,7 +52,7 @@ ClickHouse 模式同样实时调用 ThetaData，不读取或生成 CSV。`--forc
 
 `max_concurrent_requests` 控制同一个已认证 ThetaClient session 内的最大并发请求数。VALUE、STANDARD、PRO 期权订阅的官方上限分别为 2、4、8；配置缺失时默认为 1，以保持旧配置的串行行为。
 
-程序并发处理不同到期日，但每个 `expiration + data_date` 内的 OHLC、Quote、Greeks 仍依次请求，避免嵌套并发超过订阅上限。任务队列有界，主线程会立即将完成结果写入 Arrow 分片，因此不会在内存中保留整日全部 DataFrame。CSV 和 ClickHouse 模式使用同一调度方式；ClickHouse 仍在整日采集完整后才开始串行插入。
+每个 `expiration + data_date` 内的 OHLC、Quote、Greeks 仍依次请求，避免嵌套并发超过订阅上限。CSV 使用有界任务队列并发处理历史批次。ClickHouse 先统一发现日期，再严格按 `data_date` 顺序同步：当天不同 expiration 最多并发到配置上限，当天全部任务结束并成功写入数据和进度、删除当天 Arrow 临时分片后，才开始下一天。
 
 ### AWS Linux 服务管理
 
@@ -109,7 +109,7 @@ CSV 唯一键是 `symbol, expiration, strike, right, timestamp`，`data_date` �
 
 先执行 [clickhouse_schema.sql](clickhouse_schema.sql) 创建并核对正式表。程序启动时也会执行相同的 `CREATE TABLE IF NOT EXISTS`，随后严格检查列类型、引擎、分区键和排序键；不兼容时立即退出，不会自动修改表。
 
-ClickHouse 模式将每个完整日期的 Arrow 临时分片通过 Native TCP、LZ4 和 columnar insert 分批写入 `thetadata_options_chain_1m`，成功后才写 `thetadata_options_chain_1m_progress`。已有进度的 `symbol + data_date` 在创建 ThetaData client 前跳过。确认无数据时只写 `no_data` 进度。
+ClickHouse 模式将每个完整日期的 Arrow 临时分片通过 Native TCP、LZ4 和 columnar insert 分批写入 `thetadata_options_chain_1m`，成功后才写 `thetadata_options_chain_1m_progress`。每个日期写入完成后立即清理该日临时分片，长日期范围不会在 `/tmp` 累积整个范围的数据。已有进度的 `symbol + data_date` 在创建 ThetaData client 前跳过。确认无数据时只写 `no_data` 进度。
 
 数据表使用无版本列的 `ReplacingMergeTree()`。人工删除某日进度后再次同步，不会删除旧数据；相同排序键在后台 merge 后保留后写入记录。merge 前要求立即去重的查询应使用 `FINAL`。如果新版彻底缺少旧唯一键，旧行不会自动消失，这类修复需要人工删除对应数据分区行后再同步。
 

@@ -132,6 +132,11 @@ class ClickHouseSymbolStager:
         parts.append(path)
         self.rows_by_date[data_date] = self.rows_by_date.get(data_date, 0) + prepared.height
 
+    def discard_date(self, data_date: date) -> None:
+        for path in self.parts_by_date.pop(data_date, []):
+            path.unlink(missing_ok=True)
+        self.rows_by_date.pop(data_date, None)
+
     def close(self) -> None:
         self._temporary_directory.cleanup()
 
@@ -219,7 +224,9 @@ class ClickHouseThetaOptionHarvester(BaseThetaOptionHarvester):
                 )
 
             discovery_started = time.perf_counter()
-            history_jobs: list[HistoryJob] = []
+            history_jobs_by_date: dict[date, list[HistoryJob]] = {
+                data_date: [] for data_date in pending_dates
+            }
             discovery_failures = 0
             for outcome in self._discover_dates_parallel(discovery_jobs):
                 result.failures.extend(outcome.failures)
@@ -232,7 +239,7 @@ class ClickHouseThetaOptionHarvester(BaseThetaOptionHarvester):
                 for data_date in outcome.dates:
                     if data_date not in pending_set:
                         continue
-                    history_jobs.append(
+                    history_jobs_by_date[data_date].append(
                         HistoryJob(symbol, outcome.job.expiration, data_date)
                     )
             discovery_elapsed = time.perf_counter() - discovery_started
@@ -251,81 +258,129 @@ class ClickHouseThetaOptionHarvester(BaseThetaOptionHarvester):
             history_started = time.perf_counter()
             history_successes = 0
             history_failures = 0
-            for outcome in self._fetch_history_parallel(history_jobs):
-                result.failures.extend(outcome.failures)
-                expiration = outcome.job.expiration
-                data_date = outcome.job.data_date
-                merged = outcome.frame
-                if outcome.failures or merged is None:
-                    history_failures += 1
-                    incomplete.add(data_date)
-                    continue
-                history_successes += 1
-                if merged.is_empty():
-                    continue
-                try:
-                    stager.add(merged, data_date)
-                except Exception as exc:
-                    self._notify_error(
-                        "arrow_staging",
-                        f"symbol={symbol} expiration={expiration} data_date={data_date}",
-                        exc,
+            history_task_count = sum(len(jobs) for jobs in history_jobs_by_date.values())
+            insert_elapsed = 0.0
+            for data_date in pending_dates:
+                if data_date in incomplete:
+                    LOGGER.warning(
+                        "日期发现不完整，不请求历史数据或写入进度: symbol=%s date=%s",
+                        symbol, data_date,
                     )
-                    result.failures.append(
-                        FailedRequest("arrow_staging", symbol, expiration, data_date, str(exc))
-                    )
-                    history_failures += 1
-                    history_successes -= 1
-                    incomplete.add(data_date)
                     continue
-                written[data_date].add(expiration)
+
+                day_jobs = history_jobs_by_date[data_date]
+                day_started = time.perf_counter()
+                day_successes = 0
+                day_failures = 0
                 LOGGER.info(
-                    "完成暂存 symbol=%s expiration=%s date=%s rows=%d",
-                    symbol, expiration, data_date, merged.height,
+                    "开始历史日批次: symbol=%s date=%s workers=%d tasks=%d",
+                    symbol,
+                    data_date,
+                    self.max_concurrent_requests,
+                    len(day_jobs),
                 )
-            history_elapsed = time.perf_counter() - history_started
+                for outcome in self._fetch_history_parallel(day_jobs):
+                    result.failures.extend(outcome.failures)
+                    expiration = outcome.job.expiration
+                    merged = outcome.frame
+                    if outcome.failures or merged is None:
+                        history_failures += 1
+                        day_failures += 1
+                        incomplete.add(data_date)
+                        continue
+                    history_successes += 1
+                    day_successes += 1
+                    if merged.is_empty():
+                        continue
+                    try:
+                        stager.add(merged, data_date)
+                    except Exception as exc:
+                        self._notify_error(
+                            "arrow_staging",
+                            f"symbol={symbol} expiration={expiration} data_date={data_date}",
+                            exc,
+                        )
+                        result.failures.append(
+                            FailedRequest(
+                                "arrow_staging", symbol, expiration, data_date, str(exc)
+                            )
+                        )
+                        history_failures += 1
+                        history_successes -= 1
+                        day_failures += 1
+                        day_successes -= 1
+                        incomplete.add(data_date)
+                        continue
+                    written[data_date].add(expiration)
+                    LOGGER.info(
+                        "完成暂存 symbol=%s expiration=%s date=%s rows=%d",
+                        symbol, expiration, data_date, merged.height,
+                    )
+                day_elapsed = time.perf_counter() - day_started
+                LOGGER.info(
+                    "历史日批次完成: symbol=%s date=%s tasks=%d success=%d "
+                    "failed=%d elapsed=%.3fs",
+                    symbol,
+                    data_date,
+                    len(day_jobs),
+                    day_successes,
+                    day_failures,
+                    day_elapsed,
+                )
+
+                try:
+                    if data_date in incomplete:
+                        LOGGER.warning(
+                            "日期未完整抓取，不写 ClickHouse 或进度: symbol=%s date=%s",
+                            symbol,
+                            data_date,
+                        )
+                        continue
+                    parts = stager.parts_by_date.get(data_date, [])
+                    insert_started = time.perf_counter()
+                    if not parts:
+                        self.storage.write_no_data(
+                            symbol=symbol,
+                            data_date=data_date,
+                            checked_expiration_count=len(checked[data_date]),
+                        )
+                        LOGGER.info(
+                            "ClickHouse 无数据进度完成: symbol=%s date=%s",
+                            symbol,
+                            data_date,
+                        )
+                    else:
+                        row_count = stager.rows_by_date[data_date]
+                        self.storage.insert_day(
+                            parts,
+                            symbol=symbol,
+                            data_date=data_date,
+                            row_count=row_count,
+                            checked_expiration_count=len(checked[data_date]),
+                            written_expiration_count=len(written[data_date]),
+                        )
+                        LOGGER.info(
+                            "ClickHouse 日期同步完成: symbol=%s date=%s rows=%d",
+                            symbol,
+                            data_date,
+                            row_count,
+                        )
+                    insert_elapsed += time.perf_counter() - insert_started
+                finally:
+                    stager.discard_date(data_date)
+
+            history_elapsed = time.perf_counter() - history_started - insert_elapsed
             LOGGER.info(
                 "历史采集阶段完成: symbol=%s workers=%d tasks=%d success=%d "
                 "failed=%d elapsed=%.3fs batches_per_sec=%.3f",
                 symbol,
                 self.max_concurrent_requests,
-                len(history_jobs),
+                history_task_count,
                 history_successes,
                 history_failures,
                 history_elapsed,
-                len(history_jobs) / history_elapsed if history_elapsed else 0.0,
+                history_task_count / history_elapsed if history_elapsed else 0.0,
             )
-
-            insert_started = time.perf_counter()
-            for data_date in pending_dates:
-                if data_date in incomplete:
-                    LOGGER.warning(
-                        "日期未完整抓取，不写 ClickHouse 或进度: symbol=%s date=%s",
-                        symbol, data_date,
-                    )
-                    continue
-                parts = stager.parts_by_date.get(data_date, [])
-                if not parts:
-                    self.storage.write_no_data(
-                        symbol=symbol,
-                        data_date=data_date,
-                        checked_expiration_count=len(checked[data_date]),
-                    )
-                    LOGGER.info("ClickHouse 无数据进度完成: symbol=%s date=%s", symbol, data_date)
-                    continue
-                self.storage.insert_day(
-                    parts,
-                    symbol=symbol,
-                    data_date=data_date,
-                    row_count=stager.rows_by_date[data_date],
-                    checked_expiration_count=len(checked[data_date]),
-                    written_expiration_count=len(written[data_date]),
-                )
-                LOGGER.info(
-                    "ClickHouse 日期同步完成: symbol=%s date=%s rows=%d",
-                    symbol, data_date, stager.rows_by_date[data_date],
-                )
-            insert_elapsed = time.perf_counter() - insert_started
             LOGGER.info(
                 "ClickHouse 写入阶段完成: symbol=%s elapsed=%.3fs total_elapsed=%.3fs",
                 symbol,

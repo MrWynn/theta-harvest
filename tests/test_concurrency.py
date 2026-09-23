@@ -257,6 +257,101 @@ class SuccessfulHistoryClient(FailingHistoryClient):
         )
 
 
+class DailyRecordingStorage:
+    def __init__(self) -> None:
+        self.inserted_dates: list[date] = []
+        self.paths_by_date: dict[date, list[Path]] = {}
+
+    def insert_day(self, parts: object, *, data_date: date, **_: object) -> None:
+        paths = list(parts)
+        assert paths and all(path.exists() for path in paths)
+        self.paths_by_date[data_date] = paths
+        self.inserted_dates.append(data_date)
+
+    def write_no_data(self, *, data_date: date, **_: object) -> None:
+        self.inserted_dates.append(data_date)
+
+
+class DailySequencingClient:
+    def __init__(self, storage: DailyRecordingStorage) -> None:
+        self.storage = storage
+        self.expirations = (date(2026, 9, 18), date(2026, 9, 25))
+        self.data_dates = (date(2026, 9, 15), date(2026, 9, 16))
+        self.next_day_started_too_early = False
+
+    def option_list_expirations(self, **_: object) -> pl.DataFrame:
+        return pl.DataFrame({"expiration": self.expirations})
+
+    def option_list_dates(self, **_: object) -> pl.DataFrame:
+        return pl.DataFrame({"date": self.data_dates})
+
+    def option_history_ohlc(self, **kwargs: object) -> pl.DataFrame:
+        self._check_day_boundary(kwargs["date"])
+        return self._frame(kwargs["expiration"], kwargs["date"], open=1.0)
+
+    def option_history_quote(self, **kwargs: object) -> pl.DataFrame:
+        return self._frame(kwargs["expiration"], kwargs["date"], bid=1.0, ask=1.1)
+
+    def option_history_greeks_all(self, **kwargs: object) -> pl.DataFrame:
+        return self._frame(
+            kwargs["expiration"],
+            kwargs["date"],
+            delta=0.5,
+            underlying_price=100.0,
+        )
+
+    def _check_day_boundary(self, data_date: object) -> None:
+        if data_date != self.data_dates[1]:
+            return
+        first_date = self.data_dates[0]
+        first_paths = self.storage.paths_by_date.get(first_date, [])
+        if self.storage.inserted_dates != [first_date] or any(
+            path.exists() for path in first_paths
+        ):
+            self.next_day_started_too_early = True
+
+    @staticmethod
+    def _frame(expiration: object, data_date: object, **columns: object) -> pl.DataFrame:
+        values: dict[str, list[object]] = {
+            "symbol": ["NVDA"],
+            "expiration": [expiration],
+            "strike": [100.0],
+            "right": ["CALL"],
+            "timestamp": [
+                datetime.combine(data_date, datetime.min.time()).replace(
+                    hour=9,
+                    minute=30,
+                    tzinfo=ZoneInfo("America/New_York"),
+                )
+            ],
+        }
+        values.update({name: [value] for name, value in columns.items()})
+        return pl.DataFrame(values)
+
+
+def test_clickhouse_history_finishes_and_cleans_each_day_before_next() -> None:
+    storage = DailyRecordingStorage()
+    client = DailySequencingClient(storage)
+    harvester = ClickHouseThetaOptionHarvester(
+        client,
+        storage,
+        completed_dates=set(),
+        notifier=RecordingNotifier(),
+        max_concurrent_requests=2,
+    )
+
+    result = harvester.run(("NVDA",), client.data_dates[0], client.data_dates[1])
+
+    assert not result.failures
+    assert storage.inserted_dates == list(client.data_dates)
+    assert not client.next_day_started_too_early
+    assert all(
+        not path.exists()
+        for paths in storage.paths_by_date.values()
+        for path in paths
+    )
+
+
 def test_failed_parallel_history_task_does_not_write_progress(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

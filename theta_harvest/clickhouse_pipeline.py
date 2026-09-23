@@ -4,6 +4,7 @@ from datetime import date
 import logging
 from pathlib import Path
 import tempfile
+import time
 
 import polars as pl
 
@@ -11,6 +12,8 @@ from .clickhouse_storage import DATA_COLUMNS, ClickHouseStorage
 from .pipeline import (
     FailedRequest,
     HarvestResult,
+    DateDiscoveryJob,
+    HistoryJob,
     ThetaOptionHarvester as BaseThetaOptionHarvester,
     _date_values,
     _to_polars,
@@ -140,8 +143,14 @@ class ClickHouseThetaOptionHarvester(BaseThetaOptionHarvester):
         storage: ClickHouseStorage,
         completed_dates: set[tuple[str, date]],
         notifier: object,
+        max_concurrent_requests: int = 1,
     ) -> None:
-        super().__init__(client, Path(tempfile.gettempdir()), notifier)
+        super().__init__(
+            client,
+            Path(tempfile.gettempdir()),
+            notifier,
+            max_concurrent_requests,
+        )
         self.storage = storage
         self.completed_dates = completed_dates
 
@@ -169,6 +178,7 @@ class ClickHouseThetaOptionHarvester(BaseThetaOptionHarvester):
             ",".join(value.isoformat() for value in pending_dates),
             ",".join(value.isoformat() for value in skipped_dates) or "无",
         )
+        total_started = time.perf_counter()
         try:
             expiration_frame = _to_polars(
                 call_with_retry(
@@ -193,47 +203,100 @@ class ClickHouseThetaOptionHarvester(BaseThetaOptionHarvester):
         incomplete: set[date] = set()
         stager = ClickHouseSymbolStager(symbol)
         try:
+            discovery_jobs: list[DateDiscoveryJob] = []
             for expiration in expirations:
                 relevant = {value for value in pending_dates if value <= expiration}
                 if not relevant:
                     continue
-                before = len(result.failures)
-                dates = self._discover_dates(
-                    symbol, expiration, min(relevant), max(relevant), result
+                discovery_jobs.append(
+                    DateDiscoveryJob(
+                        symbol=symbol,
+                        expiration=expiration,
+                        start_date=min(relevant),
+                        end_date=max(relevant),
+                        relevant_dates=frozenset(relevant),
+                    )
                 )
-                if len(result.failures) != before:
-                    incomplete.update(relevant)
+
+            discovery_started = time.perf_counter()
+            history_jobs: list[HistoryJob] = []
+            discovery_failures = 0
+            for outcome in self._discover_dates_parallel(discovery_jobs):
+                result.failures.extend(outcome.failures)
+                if outcome.failures:
+                    discovery_failures += 1
+                    incomplete.update(outcome.job.relevant_dates)
                     continue
-                for data_date in relevant:
-                    checked[data_date].add(expiration)
-                for data_date in dates:
+                for data_date in outcome.job.relevant_dates:
+                    checked[data_date].add(outcome.job.expiration)
+                for data_date in outcome.dates:
                     if data_date not in pending_set:
                         continue
-                    merged = self._fetch_batch(symbol, expiration, data_date, result)
-                    if merged is None:
-                        incomplete.add(data_date)
-                        continue
-                    if merged.is_empty():
-                        continue
-                    try:
-                        stager.add(merged, data_date)
-                    except Exception as exc:
-                        self._notify_error(
-                            "arrow_staging",
-                            f"symbol={symbol} expiration={expiration} data_date={data_date}",
-                            exc,
-                        )
-                        result.failures.append(
-                            FailedRequest("arrow_staging", symbol, expiration, data_date, str(exc))
-                        )
-                        incomplete.add(data_date)
-                        continue
-                    written[data_date].add(expiration)
-                    LOGGER.info(
-                        "完成暂存 symbol=%s expiration=%s date=%s rows=%d",
-                        symbol, expiration, data_date, merged.height,
+                    history_jobs.append(
+                        HistoryJob(symbol, outcome.job.expiration, data_date)
                     )
+            discovery_elapsed = time.perf_counter() - discovery_started
+            LOGGER.info(
+                "日期发现阶段完成: symbol=%s workers=%d tasks=%d success=%d "
+                "failed=%d elapsed=%.3fs tasks_per_sec=%.3f",
+                symbol,
+                self.max_concurrent_requests,
+                len(discovery_jobs),
+                len(discovery_jobs) - discovery_failures,
+                discovery_failures,
+                discovery_elapsed,
+                len(discovery_jobs) / discovery_elapsed if discovery_elapsed else 0.0,
+            )
 
+            history_started = time.perf_counter()
+            history_successes = 0
+            history_failures = 0
+            for outcome in self._fetch_history_parallel(history_jobs):
+                result.failures.extend(outcome.failures)
+                expiration = outcome.job.expiration
+                data_date = outcome.job.data_date
+                merged = outcome.frame
+                if outcome.failures or merged is None:
+                    history_failures += 1
+                    incomplete.add(data_date)
+                    continue
+                history_successes += 1
+                if merged.is_empty():
+                    continue
+                try:
+                    stager.add(merged, data_date)
+                except Exception as exc:
+                    self._notify_error(
+                        "arrow_staging",
+                        f"symbol={symbol} expiration={expiration} data_date={data_date}",
+                        exc,
+                    )
+                    result.failures.append(
+                        FailedRequest("arrow_staging", symbol, expiration, data_date, str(exc))
+                    )
+                    history_failures += 1
+                    history_successes -= 1
+                    incomplete.add(data_date)
+                    continue
+                written[data_date].add(expiration)
+                LOGGER.info(
+                    "完成暂存 symbol=%s expiration=%s date=%s rows=%d",
+                    symbol, expiration, data_date, merged.height,
+                )
+            history_elapsed = time.perf_counter() - history_started
+            LOGGER.info(
+                "历史采集阶段完成: symbol=%s workers=%d tasks=%d success=%d "
+                "failed=%d elapsed=%.3fs batches_per_sec=%.3f",
+                symbol,
+                self.max_concurrent_requests,
+                len(history_jobs),
+                history_successes,
+                history_failures,
+                history_elapsed,
+                len(history_jobs) / history_elapsed if history_elapsed else 0.0,
+            )
+
+            insert_started = time.perf_counter()
             for data_date in pending_dates:
                 if data_date in incomplete:
                     LOGGER.warning(
@@ -262,5 +325,12 @@ class ClickHouseThetaOptionHarvester(BaseThetaOptionHarvester):
                     "ClickHouse 日期同步完成: symbol=%s date=%s rows=%d",
                     symbol, data_date, stager.rows_by_date[data_date],
                 )
+            insert_elapsed = time.perf_counter() - insert_started
+            LOGGER.info(
+                "ClickHouse 写入阶段完成: symbol=%s elapsed=%.3fs total_elapsed=%.3fs",
+                symbol,
+                insert_elapsed,
+                time.perf_counter() - total_started,
+            )
         finally:
             stager.close()

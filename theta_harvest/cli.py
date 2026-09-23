@@ -195,7 +195,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         client = RefreshingThetaClient(initial_client, create_client)
         if args.storage == "csv":
-            result = ThetaOptionHarvester(client, config.output_dir, notifier).run(
+            result = ThetaOptionHarvester(
+                client,
+                config.output_dir,
+                notifier,
+                config.max_concurrent_requests,
+            ).run(
                 config.symbols,
                 args.start_date,
                 args.end_date,
@@ -204,7 +209,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             assert storage is not None
             result = ClickHouseThetaOptionHarvester(
-                client, storage, completed_dates, notifier
+                client,
+                storage,
+                completed_dates,
+                notifier,
+                config.max_concurrent_requests,
             ).run(config.symbols, args.start_date, args.end_date)
         return result.exit_code
     except Exception as exc:

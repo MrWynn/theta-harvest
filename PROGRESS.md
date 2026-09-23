@@ -2,7 +2,7 @@
 
 ## Current Status
 
-ThetaData 采集器现已支持互斥的 `csv` / `clickhouse` 存储模式。CSV 的日文件、完成标记和 `--force` 行为保持不变；ClickHouse 模式实时调用 ThetaData，按日 Arrow 暂存并通过 Native TCP/LZ4 列式分批写入，全部数据成功后才写进度。Lark 已接入最终重试失败及无重试错误的即时告警。13 个非 live 测试全部通过；`NVDA / 2026-09-15` 的真实 ThetaData→ClickHouse 全链验收已成功，正式表 `FINAL` 行数及唯一键均为 1,584,332，重复运行通过进度直接跳过。当前无代码阻塞。
+ThetaData 采集器现已支持单个认证 session 内的有界并发采集，CSV 与 ClickHouse 共用同一调度器；正式 PRO 配置使用 8 workers。19 个非 live 测试全部通过；`NVDA / 2026-09-16` 的真实 8 workers 验收成功，写入及唯一键均为 1,599,972，重复运行通过进度直接跳过。当前无代码阻塞。
 
 ## Completed
 
@@ -24,7 +24,7 @@ ThetaData 采集器现已支持互斥的 `csv` / `clickhouse` 存储模式。CSV
 - AWS 管理脚本支持透传 `--storage csv|clickhouse` 和 `--force`；兼容脚本继续透传全部参数。
 - `config.toml` 已写入正式 ClickHouse/Lark 配置且仍被 `.gitignore` 忽略；`config.example.toml` 只含占位值。
 - 新增 clickhouse-driver LZ4 和 httpx 依赖，当前本地虚拟环境已安装 ClickHouse 驱动。
-- 非 live 测试通过：`13 passed, 1 deselected`，覆盖字段白名单、时间映射、NaN/零值、列式插入、失败不写进度、no_data、FINAL 进度查询、CLI 互斥和本地 HTTP Lark 重试。
+- 非 live 测试通过：`19 passed, 1 deselected`，覆盖字段白名单、时间映射、NaN/零值、列式插入、失败不写进度、no_data、FINAL 进度查询、CLI 互斥和本地 HTTP Lark 重试。
 - 真实测试首次写入时，ThetaData 全部 26 个相关到期日检查和 25 个有数据到期日暂存成功；ClickHouse 第二批因原 120 秒读写超时失败，已验证只残留首批 53,958 行且进度表没有误写完成。
 - ClickHouse `send_receive_timeout` 已提高到 900 秒；失败后普通重跑会完整重新采集，不删除旧行，并由 `ReplacingMergeTree()` 合并相同键。
 - 修正后真实全链写入成功：本轮写入 1,584,332 行，进度为 `complete`，`checked_expiration_count=26`、`written_expiration_count=25`。
@@ -32,6 +32,16 @@ ThetaData 采集器现已支持互斥的 `csv` / `clickhouse` 存储模式。CSV
 - 真实时间范围为 `2026-09-15 09:30:00-04:00` 至 `16:00:00-04:00`，最早到期日 `2026-09-16`，最晚 `2029-01-19`。
 - 同日期第二次运行约 6.4 秒完成，明确输出“请求范围内所有 symbol/date 均已同步，不创建 ThetaData client”，没有重复采集或写入。
 - 测试后 `config.toml` 的 symbols 已恢复为 `NVDA, AAPL, CBRS, NBIS`。
+- 新增 `max_concurrent_requests` 配置，范围 1–8；缺失时默认为 1，正式 PRO 配置为 8，示例配置为 4。
+- 并发分为日期发现和历史批次两阶段；不同到期日并发，每个 `expiration + data_date` 内 OHLC/Quote/Greeks 仍串行，避免嵌套超限。
+- 有界任务调度器最多保留 workers 个运行中或待消费结果；主线程按完成顺序立即写 Arrow，CSV/ClickHouse 完整性语义保持不变。
+- `RefreshingThetaClient` 并发 session 失效测试通过：多个旧 session 请求同时失败时只创建一个新 client。
+- 并发失败测试通过：任一历史任务最终失败时，ClickHouse 不写数据和进度；CSV 并发写入仍生成完整、排序正确的日文件和 marker。
+- CSV 合并已改为显式按 `timestamp, expiration, strike, right` 排序，消除并发完成顺序对文件行序的影响。
+- 真实并发测试 `NVDA / 2026-09-16`：26 个日期发现任务 15.396 秒全部成功；25 个历史批次 545.007 秒全部成功；ClickHouse 写入 1,599,972 行耗时 85.239 秒；总耗时 648.189 秒。
+- 并发真实数据核验通过：`FINAL` 行数与唯一键均为 1,599,972，25 个有数据到期日、279 个行权价、CALL/PUT，美东时间严格为 09:30–16:00，进度为 `complete`。
+- 真实并发期间没有 `UNAUTHENTICATED` 或订阅限流；首次 expirations 请求的一次本机 SOCKS 握手中断由原有重试恢复。
+- 同日期第二次运行直接显示“所有 symbol/date 均已同步，不创建 ThetaData client”。
 
 ## In Progress
 
@@ -45,9 +55,11 @@ ThetaData 采集器现已支持互斥的 `csv` / `clickhouse` 存储模式。CSV
 - ClickHouse 数据写入成功但进度写入失败时，下次会重写整日；这是预期的至少一次写入语义，最终由 ReplacingMergeTree 合并。
 - 未完成日期按日完整重抓，不实现单 expiration/API 的跨进程断点。
 - 当前 Windows 环境的 WSL Bash 启动被系统拒绝，因此本轮未重新执行 `bash -n`；脚本改动仅为参数透传，需在 AWS 部署前复核。
+- 本机真实测试经过 `127.0.0.1:10809` SOCKS 代理，8 workers 会共享代理/下行带宽；本机总耗时较此前本机串行约 13 分钟改善约 20%，未达到理论 2–3 分钟，AWS 直连效果需单独测量。
 
 ## Next Steps
 
 - 在 Amazon Linux 上运行 `bash -n scripts/theta-harvest.sh scripts/start_aws_linux.sh`，再使用服务脚本启动 ClickHouse 模式。
-- 根据实际业务日期运行其余配置 symbols；NVDA 2026-09-15 已有完成进度，将自动跳过。
+- 在 AWS 直连环境记录 8 workers 的阶段耗时；若服务端或网络争用导致收益有限，只需将 `max_concurrent_requests` 调整为 4。
+- 根据实际业务日期运行其余配置 symbols；NVDA 2026-09-15 和 2026-09-16 已有完成进度，将自动跳过。
 - 如需验证人工重同步，可删除目标 symbol/date 的进度后再运行，并分别用普通查询和 `FINAL` 检查物理重复及合并结果。

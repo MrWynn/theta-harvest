@@ -1,6 +1,8 @@
 api_key = "replace_with_your_thetadata_api_key"
 symbols = ["NVDA", "AAPL", "CBRS", "NBIS"]
 output_dir = "data"
+# ThetaData options concurrency limits: VALUE=2, STANDARD=4, PRO=8.
+max_concurrent_requests = 4
 
 [clickhouse]
 database = "replace_with_database"

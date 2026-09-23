@@ -17,6 +17,7 @@ python -m venv venv
 api_key = "your_api_key"
 symbols = ["NVDA", "AAPL", "CBRS", "NBIS"]
 output_dir = "data"
+max_concurrent_requests = 8
 ```
 
 ## 运行
@@ -46,6 +47,12 @@ ClickHouse 模式同样实时调用 ThetaData，不读取或生成 CSV。`--forc
 - `right="both"`
 
 程序不传 `start_time` 和 `end_time`，由 ThetaData SDK 使用默认美东时间 `09:30:00–16:00:00`。API 返回的 timezone 不做转换；CSV timestamp 会保留原始本地时间及 UTC offset，例如 `2026-09-15T09:30:00-0400`。
+
+### ThetaData 并发
+
+`max_concurrent_requests` 控制同一个已认证 ThetaClient session 内的最大并发请求数。VALUE、STANDARD、PRO 期权订阅的官方上限分别为 2、4、8；配置缺失时默认为 1，以保持旧配置的串行行为。
+
+程序并发处理不同到期日，但每个 `expiration + data_date` 内的 OHLC、Quote、Greeks 仍依次请求，避免嵌套并发超过订阅上限。任务队列有界，主线程会立即将完成结果写入 Arrow 分片，因此不会在内存中保留整日全部 DataFrame。CSV 和 ClickHouse 模式使用同一调度方式；ClickHouse 仍在整日采集完整后才开始串行插入。
 
 ### AWS Linux 服务管理
 

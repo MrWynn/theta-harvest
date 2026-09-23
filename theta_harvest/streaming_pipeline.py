@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 import tempfile
+import time
 import traceback
 from uuid import uuid4
 
@@ -20,6 +21,8 @@ from .completion import (
 from .pipeline import (
     FailedRequest,
     HarvestResult,
+    DateDiscoveryJob,
+    HistoryJob,
     KEY_COLUMNS,
     ThetaOptionHarvester as BaseThetaOptionHarvester,
     _date_values,
@@ -106,7 +109,9 @@ def merge_into_daily_csv(
     if not frames:
         raise ValueError(f"没有可写入的 CSV 数据源: {symbol} {data_date}")
 
-    combined = pl.concat(frames, how="diagonal_relaxed")
+    combined = pl.concat(frames, how="diagonal_relaxed").sort(
+        ["timestamp", "expiration", "strike", "right"]
+    )
     temporary_path = directory / f".{symbol}.{uuid4().hex}.tmp"
     try:
         combined.sink_csv(
@@ -188,6 +193,7 @@ class ThetaOptionHarvester(BaseThetaOptionHarvester):
             ",".join(value.isoformat() for value in pending_dates),
             ",".join(value.isoformat() for value in skipped_dates) or "无",
         )
+        total_started = time.perf_counter()
         pending_set = set(pending_dates)
         try:
             expiration_frame = _to_polars(
@@ -216,44 +222,103 @@ class ThetaOptionHarvester(BaseThetaOptionHarvester):
 
         stager = StreamingSymbolStager(symbol, self.output_dir)
         try:
+            discovery_jobs: list[DateDiscoveryJob] = []
             for expiration in expirations:
                 relevant_dates = {
                     data_date for data_date in pending_dates if data_date <= expiration
                 }
                 if not relevant_dates:
                     continue
-                failure_count = len(result.failures)
-                dates = self._discover_dates(
-                    symbol,
-                    expiration,
-                    min(relevant_dates),
-                    max(relevant_dates),
-                    result,
+                discovery_jobs.append(
+                    DateDiscoveryJob(
+                        symbol=symbol,
+                        expiration=expiration,
+                        start_date=min(relevant_dates),
+                        end_date=max(relevant_dates),
+                        relevant_dates=frozenset(relevant_dates),
+                    )
                 )
-                if len(result.failures) != failure_count:
-                    incomplete_dates.update(relevant_dates)
-                    continue
-                for data_date in relevant_dates:
-                    checked_expirations[data_date].add(expiration)
 
-                for data_date in dates:
+            discovery_started = time.perf_counter()
+            history_jobs: list[HistoryJob] = []
+            discovery_failures = 0
+            for outcome in self._discover_dates_parallel(discovery_jobs):
+                result.failures.extend(outcome.failures)
+                if outcome.failures:
+                    discovery_failures += 1
+                    incomplete_dates.update(outcome.job.relevant_dates)
+                    continue
+                for data_date in outcome.job.relevant_dates:
+                    checked_expirations[data_date].add(outcome.job.expiration)
+                for data_date in outcome.dates:
                     if data_date not in pending_set:
                         continue
-                    merged = self._fetch_batch(symbol, expiration, data_date, result)
-                    if merged is None:
+                    history_jobs.append(
+                        HistoryJob(symbol, outcome.job.expiration, data_date)
+                    )
+            discovery_elapsed = time.perf_counter() - discovery_started
+            LOGGER.info(
+                "日期发现阶段完成: symbol=%s workers=%d tasks=%d success=%d "
+                "failed=%d elapsed=%.3fs tasks_per_sec=%.3f",
+                symbol,
+                self.max_concurrent_requests,
+                len(discovery_jobs),
+                len(discovery_jobs) - discovery_failures,
+                discovery_failures,
+                discovery_elapsed,
+                len(discovery_jobs) / discovery_elapsed if discovery_elapsed else 0.0,
+            )
+
+            history_started = time.perf_counter()
+            history_successes = 0
+            history_failures = 0
+            for outcome in self._fetch_history_parallel(history_jobs):
+                result.failures.extend(outcome.failures)
+                expiration = outcome.job.expiration
+                data_date = outcome.job.data_date
+                merged = outcome.frame
+                if outcome.failures or merged is None:
+                    history_failures += 1
+                    incomplete_dates.add(data_date)
+                    continue
+                refreshed_expirations[data_date].add(expiration)
+                history_successes += 1
+                if not merged.is_empty():
+                    try:
+                        stager.add(merged, data_date)
+                    except Exception as exc:
+                        self._notify_error(
+                            "arrow_staging",
+                            f"symbol={symbol} expiration={expiration} data_date={data_date}",
+                            exc,
+                        )
+                        result.failures.append(
+                            FailedRequest("arrow_staging", symbol, expiration, data_date, str(exc))
+                        )
+                        history_failures += 1
+                        history_successes -= 1
                         incomplete_dates.add(data_date)
                         continue
-                    refreshed_expirations[data_date].add(expiration)
-                    if not merged.is_empty():
-                        stager.add(merged, data_date)
-                        written_expirations[data_date].add(expiration)
-                        LOGGER.info(
-                            "完成 symbol=%s expiration=%s date=%s rows=%d",
-                            symbol,
-                            expiration,
-                            data_date,
-                            merged.height,
-                        )
+                    written_expirations[data_date].add(expiration)
+                    LOGGER.info(
+                        "完成 symbol=%s expiration=%s date=%s rows=%d",
+                        symbol,
+                        expiration,
+                        data_date,
+                        merged.height,
+                    )
+            history_elapsed = time.perf_counter() - history_started
+            LOGGER.info(
+                "历史采集阶段完成: symbol=%s workers=%d tasks=%d success=%d "
+                "failed=%d elapsed=%.3fs batches_per_sec=%.3f",
+                symbol,
+                self.max_concurrent_requests,
+                len(history_jobs),
+                history_successes,
+                history_failures,
+                history_elapsed,
+                len(history_jobs) / history_elapsed if history_elapsed else 0.0,
+            )
 
             written_paths: list[Path] = []
             for data_date in pending_dates:
@@ -390,6 +455,11 @@ class ThetaOptionHarvester(BaseThetaOptionHarvester):
 
             if written_paths:
                 result.written_files[symbol] = written_paths
+            LOGGER.info(
+                "CSV symbol 处理完成: symbol=%s total_elapsed=%.3fs",
+                symbol,
+                time.perf_counter() - total_started,
+            )
         except Exception as exc:
             LOGGER.error("处理 %s 时发生未恢复错误\n%s", symbol, traceback.format_exc())
             self._notify_error("symbol_pipeline", f"symbol={symbol}", exc)

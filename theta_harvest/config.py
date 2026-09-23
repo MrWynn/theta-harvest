@@ -10,6 +10,7 @@ class AppConfig:
     api_key: str
     symbols: tuple[str, ...]
     output_dir: Path
+    max_concurrent_requests: int
     clickhouse: ClickHouseConfig | None
     lark: LarkConfig
 
@@ -69,6 +70,14 @@ def load_config(path: Path) -> AppConfig:
     if not output_dir.is_absolute():
         output_dir = path.parent / output_dir
 
+    max_concurrent_requests = raw.get("max_concurrent_requests", 1)
+    if (
+        isinstance(max_concurrent_requests, bool)
+        or not isinstance(max_concurrent_requests, int)
+        or not 1 <= max_concurrent_requests <= 8
+    ):
+        raise ValueError("max_concurrent_requests 必须是 1 到 8 之间的整数")
+
     raw_lark = raw.get("lark")
     if not isinstance(raw_lark, dict):
         raise ValueError("config.toml 必须提供 [lark] 配置")
@@ -100,6 +109,7 @@ def load_config(path: Path) -> AppConfig:
         api_key=api_key.strip(),
         symbols=tuple(symbols),
         output_dir=output_dir.resolve(),
+        max_concurrent_requests=max_concurrent_requests,
         clickhouse=clickhouse,
         lark=lark,
     )

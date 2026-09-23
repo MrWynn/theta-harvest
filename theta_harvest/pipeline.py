@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import date
 import logging
@@ -20,6 +21,8 @@ LOGGER = logging.getLogger(__name__)
 KEY_COLUMNS = ["symbol", "expiration", "strike", "right", "timestamp"]
 SOURCE_PRIORITY = ["quote", "greeks", "ohlc"]
 T = TypeVar("T")
+U = TypeVar("U")
+V = TypeVar("V")
 
 
 @dataclass(frozen=True)
@@ -44,6 +47,73 @@ class HarvestResult:
 
 class RetryExhaustedError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class DateDiscoveryJob:
+    symbol: str
+    expiration: date
+    start_date: date
+    end_date: date
+    relevant_dates: frozenset[date]
+
+
+@dataclass(frozen=True)
+class DateDiscoveryOutcome:
+    job: DateDiscoveryJob
+    dates: tuple[date, ...]
+    failures: tuple[FailedRequest, ...]
+
+
+@dataclass(frozen=True)
+class HistoryJob:
+    symbol: str
+    expiration: date
+    data_date: date
+
+
+@dataclass
+class HistoryOutcome:
+    job: HistoryJob
+    frame: pl.DataFrame | None
+    failures: tuple[FailedRequest, ...]
+
+
+def bounded_parallel_map(
+    items: Iterable[U],
+    operation: Callable[[U], V],
+    *,
+    max_workers: int,
+) -> Iterator[tuple[U, V]]:
+    """Run at most max_workers tasks and yield each result as soon as it completes."""
+    if max_workers == 1:
+        for item in items:
+            yield item, operation(item)
+        return
+
+    iterator = iter(items)
+    with ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="theta-request",
+    ) as executor:
+        pending: dict[Future[V], U] = {}
+        for _ in range(max_workers):
+            try:
+                item = next(iterator)
+            except StopIteration:
+                break
+            pending[executor.submit(operation, item)] = item
+
+        while pending:
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                item = pending.pop(future)
+                yield item, future.result()
+                try:
+                    next_item = next(iterator)
+                except StopIteration:
+                    continue
+                pending[executor.submit(operation, next_item)] = next_item
 
 
 class SymbolStager:
@@ -262,10 +332,17 @@ def merge_into_year_csv(
 
 
 class ThetaOptionHarvester:
-    def __init__(self, client: Any, output_dir: Path, notifier: Any | None = None) -> None:
+    def __init__(
+        self,
+        client: Any,
+        output_dir: Path,
+        notifier: Any | None = None,
+        max_concurrent_requests: int = 1,
+    ) -> None:
         self.client = client
         self.output_dir = output_dir
         self.notifier = notifier
+        self.max_concurrent_requests = max_concurrent_requests
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _notify_error(
@@ -273,6 +350,55 @@ class ThetaOptionHarvester:
     ) -> None:
         if self.notifier is not None:
             self.notifier.notify_error(operation, context, exc)
+
+    def _discover_dates_parallel(
+        self, jobs: Iterable[DateDiscoveryJob]
+    ) -> Iterator[DateDiscoveryOutcome]:
+        def execute(job: DateDiscoveryJob) -> DateDiscoveryOutcome:
+            local_result = HarvestResult()
+            dates = self._discover_dates(
+                job.symbol,
+                job.expiration,
+                job.start_date,
+                job.end_date,
+                local_result,
+            )
+            return DateDiscoveryOutcome(
+                job=job,
+                dates=tuple(dates),
+                failures=tuple(local_result.failures),
+            )
+
+        for _, outcome in bounded_parallel_map(
+            jobs,
+            execute,
+            max_workers=self.max_concurrent_requests,
+        ):
+            yield outcome
+
+    def _fetch_history_parallel(
+        self, jobs: Iterable[HistoryJob]
+    ) -> Iterator[HistoryOutcome]:
+        def execute(job: HistoryJob) -> HistoryOutcome:
+            local_result = HarvestResult()
+            frame = self._fetch_batch(
+                job.symbol,
+                job.expiration,
+                job.data_date,
+                local_result,
+            )
+            return HistoryOutcome(
+                job=job,
+                frame=frame,
+                failures=tuple(local_result.failures),
+            )
+
+        for _, outcome in bounded_parallel_map(
+            jobs,
+            execute,
+            max_workers=self.max_concurrent_requests,
+        ):
+            yield outcome
 
     def run(self, symbols: tuple[str, ...], start_date: date, end_date: date) -> HarvestResult:
         result = HarvestResult()

@@ -119,7 +119,7 @@ ClickHouse 只保存键、OHLC、Quote，以及 `delta, gamma, theta, vega, rho,
 
 每个真实 API 请求以及客户端鉴权最多尝试 5 次，使用指数退避。日志包含请求上下文、异常类型、源文件和代码行号。单个批次最终失败后会跳过该完整批次并继续处理，程序结束时汇总失败并返回非零退出码。
 
-错误通过配置的 Lark webhook 即时发送。有重试的操作只在第 5 次仍失败时告警；拼接、暂存、CSV/ClickHouse 写入和未处理异常发生时立即告警。Lark 自身失败只记本地日志，不递归告警。Webhook、API key 和 ClickHouse 密码不会写入日志或消息。
+错误通过配置的 Lark webhook 即时发送。有重试的操作只在第 5 次仍失败时告警；拼接、暂存、CSV/ClickHouse 写入和未处理异常发生时立即告警。`option_list_dates` 以及 OHLC、Quote、Greeks 历史接口的 `NoDataFoundError` 属于正常空结果，不重试或告警；三类历史结果仍按全外连接合并，同日其他 expiration 的有效数据会正常写入。Lark 自身失败只记本地日志，不递归告警。Webhook、API key 和 ClickHouse 密码不会写入日志或消息。
 
 当 gRPC 返回 `UNAUTHENTICATED` 或 `Invalid session ID` 时，后台进程会使用配置中的 API key 重新认证并替换底层 `ThetaClient`，随后由原重试周期继续刚才失败的请求。该过程不会重置 symbols、到期日循环或已经生成的临时分片。若另一台机器持续使用同一 API key，多个独立会话仍可能相互使 session 失效；程序最多尝试 5 次，不会无限重连。
 

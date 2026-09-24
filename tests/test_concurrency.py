@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
@@ -255,6 +256,90 @@ class SuccessfulHistoryClient(FailingHistoryClient):
         return self._frame(
             kwargs["expiration"], delta=0.5, underlying_price=100.0
         )
+
+
+class PartiallyEmptyHistoryClient(FailingHistoryClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.partial_expiration = date(2026, 9, 18)
+        self.empty_expiration = date(2026, 9, 25)
+        self.full_expiration = date(2026, 10, 2)
+        self.expirations = (
+            self.partial_expiration,
+            self.empty_expiration,
+            self.full_expiration,
+        )
+        self.history_calls: list[tuple[str, date]] = []
+
+    def option_history_ohlc(self, **kwargs: object) -> pl.DataFrame:
+        expiration = kwargs["expiration"]
+        self.history_calls.append(("ohlc", expiration))
+        if expiration in {self.partial_expiration, self.empty_expiration}:
+            raise NoDataFoundError("no ohlc")
+        return self._frame(expiration, open=1.0)
+
+    def option_history_quote(self, **kwargs: object) -> pl.DataFrame:
+        expiration = kwargs["expiration"]
+        self.history_calls.append(("quote", expiration))
+        if expiration == self.empty_expiration:
+            raise NoDataFoundError("no quote")
+        return self._frame(expiration, bid=1.0, ask=1.1)
+
+    def option_history_greeks_all(self, **kwargs: object) -> pl.DataFrame:
+        expiration = kwargs["expiration"]
+        self.history_calls.append(("greeks", expiration))
+        if expiration == self.empty_expiration:
+            raise NoDataFoundError("no greeks")
+        return self._frame(expiration, delta=0.5, underlying_price=100.0)
+
+
+class CapturingStorage:
+    def __init__(self) -> None:
+        self.insert_calls = 0
+        self.no_data_calls = 0
+        self.rows: list[dict[str, object]] = []
+
+    def insert_day(self, parts: object, **_: object) -> None:
+        self.insert_calls += 1
+        for path in parts:
+            self.rows.extend(pl.read_ipc(path).to_dicts())
+
+    def write_no_data(self, **_: object) -> None:
+        self.no_data_calls += 1
+
+
+def test_history_no_data_is_empty_and_other_expirations_are_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("theta_harvest.pipeline.time.sleep", lambda _: None)
+    client = PartiallyEmptyHistoryClient()
+    storage = CapturingStorage()
+    notifier = RecordingNotifier()
+    harvester = ClickHouseThetaOptionHarvester(
+        client,
+        storage,
+        completed_dates=set(),
+        notifier=notifier,
+        max_concurrent_requests=3,
+    )
+
+    result = harvester.run(("NVDA",), client.data_date, client.data_date)
+
+    assert not result.failures
+    assert storage.insert_calls == 1
+    assert storage.no_data_calls == 0
+    assert len(storage.rows) == 2
+    rows_by_expiration = {row["expiration"]: row for row in storage.rows}
+    assert rows_by_expiration[client.partial_expiration]["open"] is None
+    assert rows_by_expiration[client.partial_expiration]["bid"] == 1.0
+    assert rows_by_expiration[client.partial_expiration]["delta"] == 0.5
+    assert client.empty_expiration not in rows_by_expiration
+    assert Counter(client.history_calls) == Counter(
+        (name, expiration)
+        for expiration in client.expirations
+        for name in ("ohlc", "quote", "greeks")
+    )
+    assert not notifier.calls
 
 
 class DailyRecordingStorage:

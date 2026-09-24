@@ -570,8 +570,17 @@ class ThetaOptionHarvester:
                         operation_name=f"option_history_{name}",
                         context=context,
                         on_exhausted=self._notify_error,
+                        non_retryable_exceptions=(NoDataFoundError,),
                     )
                 )
+            except NoDataFoundError:
+                frames[name] = pl.DataFrame()
+                LOGGER.info(
+                    "option_history_%s 无数据，按空结果处理 (%s)",
+                    name,
+                    context,
+                )
+                continue
             except Exception as exc:
                 result.failures.append(
                     FailedRequest(

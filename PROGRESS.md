@@ -2,7 +2,7 @@
 
 ## Current Status
 
-ThetaData 采集器现已支持单个认证 session 内的有界并发采集；正式 PRO 配置使用 8 workers。ClickHouse 历史采集现严格按日期顺序执行，仅在当天 expiration 之间并发，当天写入和临时分片清理完成后才开始下一天。`option_list_dates()` 的正常无数据响应按空结果处理。22 个非 live 测试全部通过；当前无代码阻塞。
+ThetaData 采集器现已支持单个认证 session 内的有界并发采集；正式 PRO 配置使用 8 workers。ClickHouse 历史采集严格按日期顺序执行，仅在当天 expiration 之间并发，当天写入和临时分片清理完成后才开始下一天。列表及三个历史接口的 `NoDataFoundError` 均按正常空结果处理，同日其他 expiration 的有效数据仍会写入。23 个非 live 测试全部通过；当前无代码阻塞。
 
 ## Completed
 
@@ -47,6 +47,9 @@ ThetaData 采集器现已支持单个认证 session 内的有界并发采集；�
 - ClickHouse 长日期范围改为逐日同步：日期发现仍只执行一次，历史任务按 `data_date` 分组，每天内部最多 8 个 expiration 并发；当天成功写入数据和进度后立即删除当天 Arrow 分片，再开始下一天。
 - 历史任务失败的日期不写 ClickHouse 或进度，已暂存的当日分片也会清理；处理结束后按现有容错语义继续下一天。
 - 新增跨日调度回归测试，确认下一天请求开始前上一天已经写入且临时分片已删除；非 live 测试现为 `22 passed, 1 deselected`，`compileall` 通过。
+- OHLC、Quote、Greeks 历史接口返回 `NoDataFoundError` 时不再重试或发送 Lark，而是将该接口视为空 DataFrame 并继续请求及全外连接另外两个接口。
+- 单个 `expiration + date` 三个历史接口均为空时，该批次正常产生 0 行；只要同日其他 expiration 有数据，仍会写入 ClickHouse 并在整日成功后写完成进度。
+- 新增混合空数据回归测试，覆盖“OHLC 为空但 Quote/Greeks 有数据”及“一个 expiration 全空、其他 expiration 有数据”；非 live 测试现为 `23 passed, 1 deselected`，`compileall` 通过。
 
 ## In Progress
 
@@ -70,3 +73,4 @@ ThetaData 采集器现已支持单个认证 session 内的有界并发采集；�
 - 如需验证人工重同步，可删除目标 symbol/date 的进度后再运行，并分别用普通查询和 `FINAL` 检查物理重复及合并结果。
 - 将本次 `NoDataFoundError` 分类修复部署到 AWS 后，复跑此前失败日期，确认日志只输出一次“按空结果处理”且继续完成其他到期日。
 - 在 AWS 使用长日期范围观察新的“开始历史日批次/历史日批次完成”日志，确认 `/tmp` 只保留当前日期分片并监控内存峰值。
+- 部署历史接口空结果修复后重跑 `NVDA / 2026-02-10`，确认不再发送 `NoDataFoundError` Lark 告警，并能为同日其他 expiration 写入数据及进度。

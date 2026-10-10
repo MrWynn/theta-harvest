@@ -21,7 +21,7 @@ ThetaData 采集器现已支持单个认证 session 内的有界并发采集；�
 - 进度缺失时直接重新采集并插入，不执行数据 DELETE；同键数据由 `ReplacingMergeTree()` 后台合并。
 - Lark 告警包含主机、模式、日期、上下文、操作、异常类型和截断 traceback；重试操作仅在最终耗尽时发送一次。
 - Lark 最多尝试 3 次，发送失败只写日志；API key、ClickHouse 密码和 Webhook 会从消息中脱敏。
-- AWS 管理脚本支持透传 `--storage csv|clickhouse` 和 `--force`；兼容脚本继续透传全部参数。
+- AWS 管理脚本 `scripts/theta-harvest.sh` 支持透传 `--storage csv|clickhouse` 和 `--force`。
 - `config.toml` 已写入正式 ClickHouse/Lark 配置且仍被 `.gitignore` 忽略；`config.example.toml` 只含占位值。
 - 新增 clickhouse-driver LZ4 和 httpx 依赖，当前本地虚拟环境已安装 ClickHouse 驱动。
 - 非 live 测试通过：`19 passed, 1 deselected`，覆盖字段白名单、时间映射、NaN/零值、列式插入、失败不写进度、no_data、FINAL 进度查询、CLI 互斥和本地 HTTP Lark 重试。
@@ -54,6 +54,7 @@ ThetaData 采集器现已支持单个认证 session 内的有界并发采集；�
 - 新增 `DeadlineStubProxy`，在不修改第三方 SDK 的情况下为 ThetaData stub 的所有 unary-stream RPC 注入总 deadline；显式 timeout 保持不变。
 - CLI 的 client factory 会为首次认证和 session 失效后重新创建的 client 应用相同 deadline；`DEADLINE_EXCEEDED` 由原有最多 5 次重试和 Lark 耗尽告警处理。
 - 新增 deadline 注入、显式 timeout、重试耗尽、重新认证后 deadline 保留和配置边界测试；非 live 测试现为 `26 passed, 1 deselected`，`compileall` 通过。
+- 已删除旧兼容脚本 `scripts/start_aws_linux.sh`，README 仅保留正式管理脚本 `scripts/theta-harvest.sh` 的使用说明。
 
 ## In Progress
 
@@ -72,7 +73,7 @@ ThetaData 采集器现已支持单个认证 session 内的有界并发采集；�
 
 ## Next Steps
 
-- 在 Amazon Linux 上运行 `bash -n scripts/theta-harvest.sh scripts/start_aws_linux.sh`，再使用服务脚本启动 ClickHouse 模式。
+- 在 Amazon Linux 上运行 `bash -n scripts/theta-harvest.sh`，再使用服务脚本启动 ClickHouse 模式。
 - 在 AWS 直连环境记录 8 workers 的阶段耗时；若服务端或网络争用导致收益有限，只需将 `max_concurrent_requests` 调整为 4。
 - 根据实际业务日期运行其余配置 symbols；NVDA 2026-09-15 和 2026-09-16 已有完成进度，将自动跳过。
 - 如需验证人工重同步，可删除目标 symbol/date 的进度后再运行，并分别用普通查询和 `FINAL` 检查物理重复及合并结果。

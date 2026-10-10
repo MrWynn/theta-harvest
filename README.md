@@ -62,20 +62,13 @@ ClickHouse 模式同样实时调用 ThetaData，不读取或生成 CSV。`--forc
 服务器需要预先安装 Python 3.12 或更高版本，并在项目根目录准备好 `config.toml`。首次启动会自动创建 `.venv` 并安装依赖；任务通过 `nohup` 在后台运行，SSH 断开不会终止采集。
 
 ```bash
-chmod +x scripts/theta-harvest.sh scripts/start_aws_linux.sh
+chmod +x scripts/theta-harvest.sh
 
 ./scripts/theta-harvest.sh start 2026-09-15 2026-09-15
 ./scripts/theta-harvest.sh start 2026-09-15 2026-09-15 --storage csv --force
 ./scripts/theta-harvest.sh start 2026-09-15 2026-09-15 --storage clickhouse
 ./scripts/theta-harvest.sh status
 ./scripts/theta-harvest.sh stop
-```
-
-旧启动命令仍然可用，并会透传所有参数：
-
-```bash
-./scripts/start_aws_linux.sh 2026-09-15 2026-09-15
-./scripts/start_aws_linux.sh 2026-09-15 2026-09-15 --force
 ```
 
 日志保存在 `logs/`，当前任务 PID 保存在 `run/theta-harvest.pid`。`start` 会拒绝重复启动；`stop` 在确认 PID 属于本项目后发送 `SIGTERM`，最多等待 30 秒，不会自动强制终止其他进程。

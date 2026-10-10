@@ -495,7 +495,9 @@ def test_max_concurrent_requests_config_defaults_and_bounds(tmp_path: Path) -> N
     )
     path = tmp_path / "config.toml"
     path.write_text(base, encoding="utf-8")
-    assert load_config(path).max_concurrent_requests == 1
+    config = load_config(path)
+    assert config.max_concurrent_requests == 1
+    assert config.grpc_request_deadline_seconds == 300
 
     for valid in (1, 8):
         path.write_text(f"max_concurrent_requests = {valid}\n" + base, encoding="utf-8")
@@ -504,4 +506,12 @@ def test_max_concurrent_requests_config_defaults_and_bounds(tmp_path: Path) -> N
     for invalid in ("0", "9", "true"):
         path.write_text(f"max_concurrent_requests = {invalid}\n" + base, encoding="utf-8")
         with pytest.raises(ValueError, match="max_concurrent_requests"):
+            load_config(path)
+
+    for invalid in ("29", "3601", "true"):
+        path.write_text(
+            f"grpc_request_deadline_seconds = {invalid}\n" + base,
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="grpc_request_deadline_seconds"):
             load_config(path)

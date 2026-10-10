@@ -11,6 +11,7 @@ class AppConfig:
     symbols: tuple[str, ...]
     output_dir: Path
     max_concurrent_requests: int
+    grpc_request_deadline_seconds: int
     clickhouse: ClickHouseConfig | None
     lark: LarkConfig
 
@@ -78,6 +79,16 @@ def load_config(path: Path) -> AppConfig:
     ):
         raise ValueError("max_concurrent_requests 必须是 1 到 8 之间的整数")
 
+    grpc_request_deadline_seconds = raw.get("grpc_request_deadline_seconds", 300)
+    if (
+        isinstance(grpc_request_deadline_seconds, bool)
+        or not isinstance(grpc_request_deadline_seconds, int)
+        or not 30 <= grpc_request_deadline_seconds <= 3600
+    ):
+        raise ValueError(
+            "grpc_request_deadline_seconds 必须是 30 到 3600 之间的整数"
+        )
+
     raw_lark = raw.get("lark")
     if not isinstance(raw_lark, dict):
         raise ValueError("config.toml 必须提供 [lark] 配置")
@@ -110,6 +121,7 @@ def load_config(path: Path) -> AppConfig:
         symbols=tuple(symbols),
         output_dir=output_dir.resolve(),
         max_concurrent_requests=max_concurrent_requests,
+        grpc_request_deadline_seconds=grpc_request_deadline_seconds,
         clickhouse=clickhouse,
         lark=lark,
     )

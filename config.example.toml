@@ -3,6 +3,8 @@ symbols = ["NVDA", "AAPL", "CBRS", "NBIS"]
 output_dir = "data"
 # ThetaData options concurrency limits: VALUE=2, STANDARD=4, PRO=8.
 max_concurrent_requests = 4
+# Total deadline for each ThetaData gRPC request. Valid range: 30-3600 seconds.
+grpc_request_deadline_seconds = 300
 
 [clickhouse]
 database = "replace_with_database"

@@ -13,6 +13,7 @@ from thetadata import ThetaClient
 from .client_session import RefreshingThetaClient
 from .completion import remove_completion_marker, validate_completion
 from .config import load_config
+from .grpc_deadline import DeadlineStubProxy
 from .clickhouse_pipeline import ClickHouseThetaOptionHarvester
 from .clickhouse_storage import ClickHouseStorage
 from .notifier import LarkNotifier
@@ -185,7 +186,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
         def create_client() -> ThetaClient:
-            return ThetaClient(api_key=config.api_key, dataframe_type="polars")
+            client = ThetaClient(api_key=config.api_key, dataframe_type="polars")
+            client.stub = DeadlineStubProxy(
+                client.stub,
+                config.grpc_request_deadline_seconds,
+            )
+            return client
 
         initial_client = call_with_retry(
             create_client,

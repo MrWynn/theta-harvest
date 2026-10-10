@@ -2,7 +2,7 @@
 
 ## Current Status
 
-ThetaData 采集器现已支持单个认证 session 内的有界并发采集；正式 PRO 配置使用 8 workers。ClickHouse 历史采集严格按日期顺序执行，仅在当天 expiration 之间并发，当天写入和临时分片清理完成后才开始下一天。列表及三个历史接口的 `NoDataFoundError` 均按正常空结果处理，同日其他 expiration 的有效数据仍会写入。23 个非 live 测试全部通过；当前无代码阻塞。
+ThetaData 采集器现已支持单个认证 session 内的有界并发采集；正式 PRO 配置使用 8 workers。ClickHouse 历史采集严格按日期顺序执行，仅在当天 expiration 之间并发。所有 ThetaData gRPC stream 默认应用可配置的 300 秒总 deadline，超时后进入现有重试，避免 worker 无限卡住；重新认证生成的新 client 同样带 deadline。26 个非 live 测试全部通过；当前无代码阻塞。
 
 ## Completed
 
@@ -50,6 +50,10 @@ ThetaData 采集器现已支持单个认证 session 内的有界并发采集；�
 - OHLC、Quote、Greeks 历史接口返回 `NoDataFoundError` 时不再重试或发送 Lark，而是将该接口视为空 DataFrame 并继续请求及全外连接另外两个接口。
 - 单个 `expiration + date` 三个历史接口均为空时，该批次正常产生 0 行；只要同日其他 expiration 有数据，仍会写入 ClickHouse 并在整日成功后写完成进度。
 - 新增混合空数据回归测试，覆盖“OHLC 为空但 Quote/Greeks 有数据”及“一个 expiration 全空、其他 expiration 有数据”；非 live 测试现为 `23 passed, 1 deselected`，`compileall` 通过。
+- 新增 `grpc_request_deadline_seconds` 配置，默认及正式配置均为 300 秒，有效范围 30–3600 秒；旧配置缺失时自动使用默认值。
+- 新增 `DeadlineStubProxy`，在不修改第三方 SDK 的情况下为 ThetaData stub 的所有 unary-stream RPC 注入总 deadline；显式 timeout 保持不变。
+- CLI 的 client factory 会为首次认证和 session 失效后重新创建的 client 应用相同 deadline；`DEADLINE_EXCEEDED` 由原有最多 5 次重试和 Lark 耗尽告警处理。
+- 新增 deadline 注入、显式 timeout、重试耗尽、重新认证后 deadline 保留和配置边界测试；非 live 测试现为 `26 passed, 1 deselected`，`compileall` 通过。
 
 ## In Progress
 
@@ -64,6 +68,7 @@ ThetaData 采集器现已支持单个认证 session 内的有界并发采集；�
 - 未完成日期按日完整重抓，不实现单 expiration/API 的跨进程断点。
 - 当前 Windows 环境的 WSL Bash 启动被系统拒绝，因此本轮未重新执行 `bash -n`；脚本改动仅为参数透传，需在 AWS 部署前复核。
 - 本机真实测试经过 `127.0.0.1:10809` SOCKS 代理，8 workers 会共享代理/下行带宽；本机总耗时较此前本机串行约 13 分钟改善约 20%，未达到理论 2–3 分钟，AWS 直连效果需单独测量。
+- gRPC deadline 是整个 stream 的总时限，不是无数据空闲时限；若正常超大响应超过 300 秒，需要按实际耗时提高 `grpc_request_deadline_seconds`。
 
 ## Next Steps
 
@@ -74,3 +79,4 @@ ThetaData 采集器现已支持单个认证 session 内的有界并发采集；�
 - 将本次 `NoDataFoundError` 分类修复部署到 AWS 后，复跑此前失败日期，确认日志只输出一次“按空结果处理”且继续完成其他到期日。
 - 在 AWS 使用长日期范围观察新的“开始历史日批次/历史日批次完成”日志，确认 `/tmp` 只保留当前日期分片并监控内存峰值。
 - 部署历史接口空结果修复后重跑 `NVDA / 2026-02-10`，确认不再发送 `NoDataFoundError` Lark 告警，并能为同日其他 expiration 写入数据及进度。
+- 将 deadline 版本部署至 AWS 并重启旧进程；通过日志确认卡住的请求在 300 秒后产生 `DEADLINE_EXCEEDED` 并进入第 2/5 次重试。

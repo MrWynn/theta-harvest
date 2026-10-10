@@ -18,6 +18,7 @@ api_key = "your_api_key"
 symbols = ["NVDA", "AAPL", "CBRS", "NBIS"]
 output_dir = "data"
 max_concurrent_requests = 8
+grpc_request_deadline_seconds = 300
 ```
 
 ## 运行
@@ -53,6 +54,8 @@ ClickHouse 模式同样实时调用 ThetaData，不读取或生成 CSV。`--forc
 `max_concurrent_requests` 控制同一个已认证 ThetaClient session 内的最大并发请求数。VALUE、STANDARD、PRO 期权订阅的官方上限分别为 2、4、8；配置缺失时默认为 1，以保持旧配置的串行行为。
 
 每个 `expiration + data_date` 内的 OHLC、Quote、Greeks 仍依次请求，避免嵌套并发超过订阅上限。CSV 使用有界任务队列并发处理历史批次。ClickHouse 先统一发现日期，再严格按 `data_date` 顺序同步：当天不同 expiration 最多并发到配置上限，当天全部任务结束并成功写入数据和进度、删除当天 Arrow 临时分片后，才开始下一天。
+
+`grpc_request_deadline_seconds` 是每次 ThetaData gRPC stream 的总时限，默认 300 秒，有效范围为 30–3600 秒。超过时限后 gRPC 会取消当前 stream 并返回 `DEADLINE_EXCEEDED`，随后进入现有的最多 5 次重试，避免单个 worker 永久卡住。该值是整个 RPC 的总 deadline，不是空闲超时；如果正常的大响应确实需要更长时间，应适当调高。
 
 ### AWS Linux 服务管理
 
@@ -117,7 +120,7 @@ ClickHouse 只保存键、OHLC、Quote，以及 `delta, gamma, theta, vega, rho,
 
 ## 错误和重试
 
-每个真实 API 请求以及客户端鉴权最多尝试 5 次，使用指数退避。日志包含请求上下文、异常类型、源文件和代码行号。单个批次最终失败后会跳过该完整批次并继续处理，程序结束时汇总失败并返回非零退出码。
+每个真实 API 请求以及客户端鉴权最多尝试 5 次，使用指数退避。ThetaData gRPC 请求还受 `grpc_request_deadline_seconds` 限制，超时产生的 `DEADLINE_EXCEEDED` 与其他临时网络错误一样进入重试。日志包含请求上下文、异常类型、源文件和代码行号。单个批次最终失败后会跳过该完整批次并继续处理，程序结束时汇总失败并返回非零退出码。
 
 错误通过配置的 Lark webhook 即时发送。有重试的操作只在第 5 次仍失败时告警；拼接、暂存、CSV/ClickHouse 写入和未处理异常发生时立即告警。`option_list_dates` 以及 OHLC、Quote、Greeks 历史接口的 `NoDataFoundError` 属于正常空结果，不重试或告警；三类历史结果仍按全外连接合并，同日其他 expiration 的有效数据会正常写入。Lark 自身失败只记本地日志，不递归告警。Webhook、API key 和 ClickHouse 密码不会写入日志或消息。
 

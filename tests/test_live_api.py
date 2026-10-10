@@ -10,6 +10,7 @@ from thetadata import ThetaClient
 from theta_harvest.client_session import RefreshingThetaClient
 from theta_harvest.completion import marker_path, validate_completion
 from theta_harvest.config import load_config
+from theta_harvest.grpc_deadline import DeadlineStubProxy
 from theta_harvest.pipeline import KEY_COLUMNS, call_with_retry
 from theta_harvest.streaming_pipeline import ThetaOptionHarvester
 
@@ -20,7 +21,12 @@ def test_real_api_full_chain_is_idempotent(tmp_path: Path) -> None:
     assert config.symbols == ("NVDA", "AAPL", "CBRS", "NBIS")
 
     def create_client() -> ThetaClient:
-        return ThetaClient(api_key=config.api_key, dataframe_type="polars")
+        client = ThetaClient(api_key=config.api_key, dataframe_type="polars")
+        client.stub = DeadlineStubProxy(
+            client.stub,
+            config.grpc_request_deadline_seconds,
+        )
+        return client
 
     initial_client = call_with_retry(
         create_client,
